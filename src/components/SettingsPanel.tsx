@@ -9,7 +9,8 @@
  * - 仅保存到模块级 llmKeyStore，不写 localStorage / cookie / IndexedDB
  * - 不在 console.log 中输出明文 key
  *
- * 优先级：用户在 UI 中输入的运行时 key > .env 编译期注入的 key
+ * **不再从 .env 自动加载 key**（VITE_DEEPSEEK_API_KEY 会被打包到前端 bundle 暴露）。
+ * 用户必须在 UI 中显式输入。详见 llmKeyStore.ts。
  *
  * 视觉层次（从最显眼的入口到最细节）：
  * 1. APIKeyHint 横幅 — 未配置时顶部醒目黄色 CTA，已配置时紧凑绿色徽章
@@ -18,7 +19,7 @@
  */
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { llmKeyStore, maskKey, getEnvKey } from '../store/llmKeyStore';
+import { llmKeyStore, maskKey } from '../store/llmKeyStore';
 import { reloadAdvisor } from '../hooks/usePixiApp';
 
 type TestState =
@@ -29,19 +30,19 @@ type TestState =
 
 /** 共用的"当前 LLM 状态" hook */
 function useLLMStatus() {
-  const [hasEnvKey, setHasEnvKey] = useState<boolean>(!!getEnvKey());
+  // 已移除 env 自动加载：VITE_DEEPSEEK_API_KEY 会被打包进前端 bundle 暴露给所有访问者。
+  // 因此只跟踪运行时 key（在 UI 中由用户输入）。
   const [hasRuntimeKey, setHasRuntimeKey] = useState<boolean>(!!llmKeyStore.getKey());
 
   useEffect(() => {
     const refresh = () => {
-      setHasEnvKey(!!getEnvKey());
       setHasRuntimeKey(!!llmKeyStore.getKey());
     };
     refresh();
     return llmKeyStore.subscribe(refresh);
   }, []);
 
-  return { hasEnvKey, hasRuntimeKey, hasAnyKey: hasEnvKey || hasRuntimeKey };
+  return { hasRuntimeKey, hasAnyKey: hasRuntimeKey };
 }
 
 // ===== 顶部提示横幅 =====
@@ -86,7 +87,7 @@ export const APIKeyHint: React.FC = () => {
             启用 AI 战略顾问，让你的对手更聪明！
           </span>
           <span className="text-yellow-300/70 text-xs">
-            需要 DeepSeek API Key（仅保存在内存，刷新即清空）
+            需要 DeepSeek API Key（在 UI 输入，仅存内存，不写入任何文件）
           </span>
         </div>
         <span className="ml-4 px-4 py-1.5 bg-yellow-400 text-yellow-900 font-game font-bold text-sm rounded shadow-lg hover:bg-yellow-300 transition-colors">
@@ -102,7 +103,7 @@ export const APIKeyHint: React.FC = () => {
 const SettingsModal: React.FC<{ open: boolean; onClose: () => void }> = ({ open, onClose }) => {
   const [input, setInput] = useState('');
   const [showKey, setShowKey] = useState(false);
-  const { hasEnvKey, hasRuntimeKey } = useLLMStatus();
+  const { hasRuntimeKey } = useLLMStatus();
   const [testState, setTestState] = useState<TestState>({ kind: 'idle' });
   const pendingKeyRef = useRef<string | null>(null);
 
@@ -173,13 +174,7 @@ const SettingsModal: React.FC<{ open: boolean; onClose: () => void }> = ({ open,
     await reloadAdvisor();
   }, []);
 
-  const source = llmKeyStore.getSource();
-  const statusLabel =
-    !hasEnvKey && !hasRuntimeKey
-      ? '未配置'
-      : hasRuntimeKey
-        ? '运行时 Key（生效中）'
-        : '本地 .env Key（生效中）';
+  const statusLabel = hasRuntimeKey ? '运行时 Key（生效中）' : '未配置';
 
   if (!open) return null;
 
@@ -202,11 +197,6 @@ const SettingsModal: React.FC<{ open: boolean; onClose: () => void }> = ({ open,
           <div className={`text-sm font-game ${statusLabel === '未配置' ? 'text-gray-400' : 'text-green-400'}`}>
             {statusLabel}
           </div>
-          {source === 'env' && hasEnvKey && (
-            <div className="text-xs text-gray-500 mt-1 font-mono">
-              来源: {maskKey(getEnvKey())}（.env 编译期注入）
-            </div>
-          )}
         </div>
 
         <label className="block text-sm text-gray-300 mb-2 font-game">DeepSeek API Key</label>
@@ -244,7 +234,7 @@ const SettingsModal: React.FC<{ open: boolean; onClose: () => void }> = ({ open,
         </div>
 
         {hasRuntimeKey && (
-          <button onClick={handleClearRuntime} className="w-full mt-2 px-4 py-2 rounded text-sm font-game bg-red-500/20 text-red-300 border border-red-500/40 hover:bg-red-500/40 transition-colors">🗑 清除运行时 Key（回退到 .env）</button>
+          <button onClick={handleClearRuntime} className="w-full mt-2 px-4 py-2 rounded text-sm font-game bg-red-500/20 text-red-300 border border-red-500/40 hover:bg-red-500/40 transition-colors">🗑 清除运行时 Key（完全关闭 LLM）</button>
         )}
 
         <div className="mt-4 p-3 rounded bg-yellow-900/20 border border-yellow-700/30 text-xs text-yellow-200/80 leading-relaxed">
@@ -281,7 +271,7 @@ export const SettingsPanel: React.FC = () => {
         </span>
         <span className="font-bold">{hasAnyKey ? '🤖 AI 已启用' : '🧠 AI 未启用'}</span>
         {hasRuntimeKey && (
-          <span className="text-[10px] text-amber-300 ml-0.5" title="运行时 Key（覆盖 .env）">Ⓡ</span>
+          <span className="text-[10px] text-amber-300 ml-0.5" title="运行时 Key（保存在内存中）">Ⓡ</span>
         )}
         {!hasAnyKey && (
           <span className="text-[10px] bg-yellow-400 text-yellow-900 px-1.5 py-0.5 rounded ml-1 font-bold animate-pulse">

@@ -60,10 +60,10 @@ export function usePixiApp(options: UsePixiAppOptions = {}) {
     };
     renderLoop();
 
-    // === 接入 DeepSeek 战略顾问（仅当配置了 key 时）===
+    // === 接入 DeepSeek 战略顾问（仅当用户在 UI 输入了 key 时）===
     // 引擎每 ~60s 调一次 advise() 调整 mode + weights；
     // 本地 AI 仍由 DefaultAIDecisionMaker 负责每 2s 决策。
-    // 优先使用运行时用户输入的 key（llmKeyStore），其次使用 .env 编译期注入的 key。
+    // 已移除 .env 自动加载以避免 key 被打包到前端 bundle 暴露给访问者。
     reloadAdvisor();
 
     return () => {
@@ -114,8 +114,10 @@ export function usePixiApp(options: UsePixiAppOptions = {}) {
 /**
  * 重新挂载 DeepSeek 战略顾问。
  *
- * 优先使用 llmKeyStore 中的运行时 key；若无则回退到 .env 编译期注入的 key；
- * 都没有则卸下 advisor（关闭 LLM 功能，回到纯本地启发式 AI）。
+ * 仅使用 llmKeyStore 中的运行时 key（用户在 UI 中输入的）。
+ * **不再回退到 .env 编译期注入的 key**，因为那样会把 key 打包进前端 bundle 暴露给任何访问者。
+ *
+ * 未配置 key 时卸下 advisor（关闭 LLM 功能，回到纯本地启发式 AI）。
  *
  * 该函数是幂等的：调用前先 setStrategicAdvisor(null)，再按需装载新实例。
  * 用户在 UI 中保存/清除 key 后调用本函数即可生效。
@@ -134,6 +136,7 @@ export async function reloadAdvisor(): Promise<void> {
     return;
   }
 
+  // baseUrl / model / timeout 不是敏感配置，可以从 .env 读（不会泄漏密钥）
   const baseUrl = (import.meta.env.VITE_DEEPSEEK_BASE_URL as string | undefined) || undefined;
   const model = (import.meta.env.VITE_DEEPSEEK_MODEL as string | undefined) || undefined;
   const timeoutMs = Number(import.meta.env.VITE_DEEPSEEK_TIMEOUT_MS) || undefined;
@@ -143,7 +146,7 @@ export async function reloadAdvisor(): Promise<void> {
     const advisor = new DeepSeekStrategicAdvisor({ apiKey, baseUrl, model, timeoutMs });
     getGameEngine().setStrategicAdvisor(advisor);
     console.log('[DeepSeekAdvisor] 已启用 -', {
-      source: llmKeyStore.getSource() === 'runtime' ? 'runtime' : 'env',
+      source: 'runtime',
       baseUrl: baseUrl || 'https://api.deepseek.com',
       model: model || 'deepseek-chat',
       interval: '60s/次',
