@@ -5,8 +5,9 @@
 
 import { useGameStore } from '../store/gameStore';
 import { getGameLoop, GameLoop } from './GameLoop';
-import { gameEvents, GameEvents } from './Events';
+import { gameEvents } from './Events';
 import { DIFFICULTY_CONFIG } from '../config/gameConfig';
+import { playSound } from '../components/SoundControl';
 
 // 导入各游戏系统
 import { CombatSystem } from '../systems/CombatSystem';
@@ -42,11 +43,12 @@ export class Game {
   // 时间追踪
   private lastFoodTime = 0;
   private lastAIDecisionTime = 0;
-  private lastUnlockGameTime = 0;
+  private _lastUnlockGameTime = 0;
 
   // 状态追踪
   private isInitialized = false;
-  private postGameSummarized = false;
+  private _postGameSummarized = false;
+  private previousStatus: 'idle' | 'playing' | 'paused' | 'victory' | 'defeat' = 'idle';
 
   constructor() {
     this.gameLoop = getGameLoop();
@@ -124,8 +126,8 @@ export class Game {
     // 重置时间追踪
     this.lastFoodTime = Date.now();
     this.lastAIDecisionTime = Date.now();
-    this.lastUnlockGameTime = 0;
-    this.postGameSummarized = false;
+    this._lastUnlockGameTime = 0;
+    this._postGameSummarized = false;
 
     console.log('[Game] Reset');
   }
@@ -138,7 +140,21 @@ export class Game {
 
     // 检查游戏是否结束
     if (state.status === 'victory' || state.status === 'defeat') {
+      // 检查是否刚结束，播放音效
+      if (this.previousStatus === 'playing') {
+        if (state.status === 'victory') {
+          playSound.ui('victory');
+        } else {
+          playSound.ui('defeat');
+        }
+      }
+      this.previousStatus = state.status;
       return;
+    }
+
+    // 更新 previousStatus
+    if (state.status !== this.previousStatus) {
+      this.previousStatus = state.status;
     }
 
     // 更新游戏时间

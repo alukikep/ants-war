@@ -5,11 +5,10 @@
 
 import React from 'react';
 import { useGameStore, calculateHatcheryCost } from '../store/gameStore';
-import { 
-  HEAD_CONFIGS, 
-  THORAX_CONFIGS, 
+import {
+  HEAD_CONFIGS,
+  THORAX_CONFIGS,
   ABDOMEN_CONFIGS,
-  calculateAntStats,
 } from '../config/partStats';
 import type { HeadVariant, ThoraxVariant, AbdomenVariant, PartConfig } from '../types';
 import { BuildPanel } from './BuildPanel';
@@ -27,9 +26,10 @@ const STAT_TAGS = [
 const SPECIAL_TAGS: Record<string, { label: string; color: string }> = {
   'head:odontomachus': { label: '弹射逃脱', color: 'bg-yellow-500/20 border-yellow-500/40 text-yellow-400' },
   'head:termiteSoldier': { label: '攻速光环', color: 'bg-purple-500/20 border-purple-500/40 text-purple-400' },
+  'head:fire': { label: '双倍孵化', color: 'bg-orange-500/20 border-orange-500/40 text-orange-400' },
   'abdomen:spitter': { label: '远程攻击', color: 'bg-cyan-500/20 border-cyan-500/40 text-cyan-400' },
   'abdomen:matabele': { label: '尾针技能', color: 'bg-emerald-500/20 border-emerald-500/40 text-emerald-400' },
-  'thorax:leafcutter': { label: '嘲讽+护甲', color: 'bg-amber-500/20 border-amber-500/40 text-amber-400' },
+  'thorax:leafcutter': { label: '低血嘲讽+回血', color: 'bg-amber-500/20 border-amber-500/40 text-amber-400' },
   'head:bigHead': { label: '秒杀', color: 'bg-red-500/20 border-red-500/40 text-red-400' },
   'abdomen:honeypot': { label: '死亡回复', color: 'bg-orange-500/20 border-orange-500/40 text-orange-400' },
 };
@@ -46,17 +46,17 @@ const StatTags: React.FC<{ config: PartConfig }> = ({ config }) => {
       {STAT_TAGS.map(({ key, label, color, bgColor }) => {
         const value = stats[key];
         if (value === 0) return null;
-        
-        // 木蚁腹的hp是-30，但实际是百分比惩罚
-        const displayValue = variant === 'spitter' && key === 'hp' 
-          ? '-30%' 
-          : (key === 'attackSpeed' 
-            ? `${value > 0 ? '+' : ''}${value}%` 
+
+        // 木蚁腹的hp是负数，表示百分比惩罚
+        const displayValue = key === 'hp' && value < 0
+          ? `${value}%`
+          : (key === 'attackSpeed'
+            ? `${value > 0 ? '+' : ''}${value}%`
             : `${value > 0 ? '+' : ''}${value}`);
-        
+
         return (
-          <span 
-            key={key} 
+          <span
+            key={key}
             className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs font-game border ${bgColor} ${color}`}
           >
             {label}{displayValue}
@@ -78,20 +78,14 @@ const StatTags: React.FC<{ config: PartConfig }> = ({ config }) => {
 };
 
 export const AssemblyPanel: React.FC = () => {
-  const { 
-    playerTemplate, 
-    setPlayerHead, 
-    setPlayerThorax, 
+  const {
+    playerTemplate,
+    setPlayerHead,
+    setPlayerThorax,
     setPlayerAbdomen,
     playerFood,
     playerUnlockedParts,
   } = useGameStore();
-
-  const currentStats = calculateAntStats(
-    playerTemplate.head,
-    playerTemplate.thorax,
-    playerTemplate.abdomen
-  );
 
   const hatcheryCost = calculateHatcheryCost(playerTemplate);
 
@@ -116,7 +110,7 @@ export const AssemblyPanel: React.FC = () => {
           </h3>
           <div className="flex items-center gap-4">
             <span className="text-sm text-gray-400">
-              孵化室成本: 
+              孵化室成本:
               <span className={`ml-2 font-game ${playerFood >= hatcheryCost ? 'text-yellow-400' : 'text-red-400'}`}>
                 {hatcheryCost}
               </span>
@@ -192,41 +186,6 @@ export const AssemblyPanel: React.FC = () => {
             <p className="text-xs text-gray-500 leading-relaxed mt-1">
               {selectedAbdomen.description}
             </p>
-          </div>
-
-          {/* 当前属性预览 */}
-          <div className="bg-gray-800/50 rounded-lg p-3 border border-bio-primary/20">
-            <h4 className="text-bio-secondary font-game text-xs mb-2">总属性</h4>
-            <div className="space-y-1.5 text-xs">
-              <div className="flex justify-between items-center">
-                <span className="text-gray-400">生命</span>
-                <span className="text-red-400 font-game font-bold">{currentStats.hp}</span>
-              </div>
-              <div className="flex justify-between items-center">
-                <span className="text-gray-400">攻击</span>
-                <span className="text-orange-400 font-game font-bold">{currentStats.damage}</span>
-              </div>
-              {currentStats.isRanged && (
-                <div className="flex justify-between items-center">
-                  <span className="text-gray-400">远程</span>
-                  <span className="text-cyan-400 font-game font-bold">{currentStats.rangedDamage}</span>
-                </div>
-              )}
-              <div className="flex justify-between items-center">
-                <span className="text-gray-400">速度</span>
-                <span className="text-green-400 font-game font-bold">{currentStats.speed}</span>
-              </div>
-              <div className="flex justify-between items-center">
-                <span className="text-gray-400">攻速</span>
-                <span className="text-blue-400 font-game font-bold">{currentStats.attackSpeed}ms</span>
-              </div>
-            </div>
-            {/* 蚂蚁预览 */}
-            <div className="mt-2 pt-2 border-t border-gray-700 flex items-center justify-center gap-1">
-              <div className="w-5 h-3 rounded-full bg-player-blue" />
-              <div className="w-4 h-3 rounded-full bg-blue-700" />
-              <div className="w-6 h-4 rounded-full bg-player-blue" />
-            </div>
           </div>
 
           {/* 建造面板 */}

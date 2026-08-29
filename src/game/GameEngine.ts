@@ -8,6 +8,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { useGameStore, calculateHatcheryCost } from '../store/gameStore';
 import { GAME_CONFIG, QUEEN_CONFIG, UNLOCK_CONFIG, QUEEN_ATTACK_CONFIG, DIFFICULTY_CONFIG } from '../config/gameConfig';
 import { RANGED_CONFIG, ESCAPE_ABILITY_CONFIG, SPITTER_SLOW_CONFIG, ATTACK_SPEED_AURA_CONFIG, STINGER_ABILITY_CONFIG, TAUNT_ABILITY_CONFIG, INSTANT_KILL_CONFIG, HONEYPOT_EXPLOSION_CONFIG, HEAD_CONFIGS, THORAX_CONFIGS, ABDOMEN_CONFIGS, calculateAntStats } from '../config/partStats';
+import { playSound } from '../components/SoundControl';
 
 // ============================================
 // AI 决策接口
@@ -58,6 +59,10 @@ export interface AIBattleContext {
   // 蚂蚁数量
   enemyAntsCount: number;
   playerAntsCount: number;
+  // 当前存活蚂蚁按部件组合的兵种构成（供战略层识别战术）
+  // 按 (head, thorax, abdomen) 三元组聚合，每条 = {h, t, a, count, maxLv}
+  enemyComposition: AntCompositionEntry[];
+  playerComposition: AntCompositionEntry[];
   // 可用建造位置
   availableBuildPositions: GridPosition[];
   // 可升级的孵化室
@@ -71,10 +76,69 @@ export interface AIBattleContext {
 }
 
 /**
+ * 兵种构成条目：按 (head, thorax, abdomen) 聚合的存活蚂蚁统计
+ */
+export interface AntCompositionEntry {
+  /** 头部变体 ID */
+  h: HeadVariant;
+  /** 胸部变体 ID */
+  t: ThoraxVariant;
+  /** 腹部变体 ID */
+  a: AbdomenVariant;
+  /** 该模板存活蚂蚁数量 */
+  count: number;
+  /** 该模板所对应的最高孵化室等级（决定能力按等级加成的强度） */
+  maxLv: number;
+}
+
+/**
  * AI 决策器接口
  */
 export interface AIDecisionMaker {
   makeDecision(context: AIBattleContext): AIDecision;
+}
+
+/**
+ * AI 部件权重：每个变体一个非负数权重，0 表示禁用。
+ * LLM 战略顾问通过调整权重数组影响本地 AI 出虫倾向。
+ */
+export interface PartWeights {
+  heads: Partial<Record<HeadVariant, number>>;
+  thoraxes: Partial<Record<ThoraxVariant, number>>;
+  abdomens: Partial<Record<AbdomenVariant, number>>;
+}
+
+/**
+ * 部件权重取值范围：必须是 0~MAX 之间的整数。
+ * 0 = 禁用该部件，MAX = 最强偏好。
+ * 校验逻辑见 DeepSeekStrategicAdvisor.filterWeights 与 DefaultAIDecisionMaker.setWeights。
+ */
+export const PART_WEIGHT_RANGE = {
+  MIN: 0,
+  MAX: 5,
+} as const;
+
+/**
+ * LLM 战略顾问的输出：长期策略 + 部件权重调整 + 嘲讽语
+ */
+export interface StrategicDirective {
+  /** AI 战略模式 */
+  mode: AIMode;
+  /** 部件权重（会写入 DefaultAIDecisionMaker） */
+  weights: PartWeights;
+  /** 战术评语，会推给 AITrashTalk UI */
+  taunt?: string;
+}
+
+/**
+ * LLM 战略顾问接口（不是决策器）：每 ~60s 调用一次，返回战略指令
+ */
+export interface IStrategicAdvisor {
+  /**
+   * 异步方法，返回当前推荐的战略指令。
+   * 实现类应自行处理超时、节流、回退到默认指令。
+   */
+  advise(context: AIBattleContext): Promise<StrategicDirective>;
 }
 
 /**
@@ -89,6 +153,62 @@ export class DefaultAIDecisionMaker implements AIDecisionMaker {
 
   /** AI 首选模板 */
   preferredTemplate: AntTemplate | null = null;
+
+  /**
+   * 部件权重。LLM 战略顾问通过 setWeights() 更新。
+   * 默认全 0 → selectTemplate 退化为均匀随机（因为没有任何项有权重）。
+   * LLM 第一次给出指令后会写入具体权重。
+   */
+  weights: PartWeights = {
+    heads: {},
+    thoraxes: {},
+    abdomens: {},
+  };
+
+  /**
+   * 上次执行 demolish 的游戏时间（ms）
+   *
+   * 全局冷却：任何 demolish 之后 10 游戏秒内，禁止再次 demolish（可以 build/upgrade/wait）。
+   * 用单一时间戳代替 Map<gridPos, time>，避免按格子 key 失效导致绕开 cooldown。
+   * - 暂停时 gameTime 不走，cooldown 同步冻结
+   * - 3x 速下 10 游戏秒 ≈ 3.3 真实秒
+   */
+  private lastDemolishGameTime: number = -Infinity;
+
+  /**
+   * 拆除冷却时间（10 游戏秒）
+   */
+  private static readonly HATCHERY_DEMOLISH_COOLDOWN_MS = 10_000;
+
+  /**
+   * 权重匹配分差距阈值：差距 ≥ 此值才触发"拆弱建强"
+   * weights 范围是 0~5，每段部件最大 5 分，三段总和最大 15 分。
+   * 阈值 2 意味着要至少差出"一段部件的强偏好 vs 不存在/极低"的差距才算值得拆。
+   */
+  private static readonly SCORE_GAP_THRESHOLD = 2;
+
+  /**
+   * 替换全部权重。LLM 战略顾问每 ~60s 调一次。
+   * 自动忽略超出 0~5 范围、非数字、非整数；未列出的变体视为权重 0。
+   * 范围与整数限制与 DeepSeekStrategicAdvisor.filterWeights 保持一致。
+   */
+  setWeights(weights: PartWeights): void {
+    const clean = (input: Record<string, unknown> | undefined): Record<string, number> => {
+      const out: Record<string, number> = {};
+      if (!input) return out;
+      for (const [k, v] of Object.entries(input)) {
+        if (typeof v !== 'number' || !Number.isFinite(v)) continue;
+        if (v < PART_WEIGHT_RANGE.MIN || v > PART_WEIGHT_RANGE.MAX) continue;
+        out[k] = Math.floor(v);
+      }
+      return out;
+    };
+    this.weights = {
+      heads: clean(weights.heads as Record<string, unknown>),
+      thoraxes: clean(weights.thoraxes as Record<string, unknown>),
+      abdomens: clean(weights.abdomens as Record<string, unknown>),
+    };
+  }
 
   makeDecision(context: AIBattleContext): AIDecision {
     const { enemyFood, enemyHatcheries, availableBuildPositions, availableHeads, availableThoraxes, availableAbdomens } = context;
@@ -197,84 +317,188 @@ export class DefaultAIDecisionMaker implements AIDecisionMaker {
   }
 
   /**
-   * 模式3: 迭代替换
-   * 拆除最弱/最不匹配的孵化室 → 建造更强的 → 满了则升级
+   * 模式3: 迭代替换（按权重判断）
+   * - 拆除"与当前 weights 最不匹配"的孵化室（不再用硬编码战力公式）
+   * - 建造"最符合 weights"的理想模板（不再用采样，改用确定性 top1）
+   * - 满级场景也会主动拆建（不再死循环在 upgrade）
+   * - 同一孵化室在 HATCHERY_DEMOLISH_COOLDOWN_MS 内不会被反复拆除（避免震荡）
    */
   private decideIterate(context: AIBattleContext): AIDecision {
-    const { enemyFood, enemyHatcheries, availableBuildPositions, upgradableHatcheries, availableHeads, availableThoraxes, availableAbdomens } = context;
+    const {
+      enemyFood,
+      enemyHatcheries,
+      availableBuildPositions,
+      upgradableHatcheries,
+      availableHeads,
+      availableThoraxes,
+      availableAbdomens,
+    } = context;
 
-    // 计算当前推荐模板的建造成本
-    const targetTemplate = this.selectTemplate(availableHeads, availableThoraxes, availableAbdomens);
-    const targetCost = calculateHatcheryCost(targetTemplate);
+    // 清理过期的 demolish cooldown 条目（避免 Map 无限增长）
+    // （全局时间戳方案无需清理）
 
-    // 计算所有敌方孵化室的战力，找出最弱的
-    const hatcheryPowers = enemyHatcheries.map(h => ({
-      hatchery: h,
-      power: this.calculateHatcheryPower(h),
-    }));
-    const weakestEntry = hatcheryPowers.reduce((min, curr) =>
-      curr.power < min.power ? curr : min,
-      hatcheryPowers[0]
+    // ① 计算"最符合 weights"的理想模板（确定性 top1，便于对比 score）
+    const targetTemplate = this.pickBestTemplateByWeights(
+      availableHeads,
+      availableThoraxes,
+      availableAbdomens,
     );
+    const targetCost = calculateHatcheryCost(targetTemplate);
+    const targetScore = this.scoreTemplateByWeights(targetTemplate);
 
-    // 当接近满员时（剩余<=1个位置），考虑拆建替换
-    if (availableBuildPositions.length <= 1 && enemyHatcheries.length > 0 && weakestEntry) {
-      const weakest = weakestEntry.hatchery;
-      const weakestPower = weakestEntry.power;
-      const targetPower = this.calculateTemplatePower(targetTemplate);
+    // ② 计算每个己方孵化室与 weights 的匹配分，找出最不匹配
+    const scored = enemyHatcheries.map((h) => ({
+      hatchery: h,
+      score: this.scoreHatcheryByWeights(h),
+    }));
+    const worst =
+      scored.length > 0
+        ? scored.reduce((min, curr) => (curr.score < min.score ? curr : min))
+        : null;
 
-      // 计算拆除后能返还多少食物
-      const refundEstimate = Math.floor(weakest.totalInvested * GAME_CONFIG.demolishRefundRate);
-      const totalFoodAfterDemolish = enemyFood + refundEstimate;
+    // ③ 满级场景也主动迭代（不再因等级已满跳过拆建）
+    // 使用 gameTime 而不是 performance.now()：
+    // - 暂停时 gameTime 不走，cooldown 同步冻结
+    // - 3x 速下 10 游戏秒 ≈ 3.3 真实秒
+    const now = context.gameTime;
 
-      // 只有当新模板比最弱孵化室强至少10%时才拆建
-      // 并且拆建后食物够建新的
-      if (weakestPower * 1.1 < targetPower && totalFoodAfterDemolish >= targetCost) {
-        return {
-          action: 'demolish',
-          targetHatcheryId: weakest.id,
-          reason: `[迭代] 拆除弱孵化室(战力${weakestPower.toFixed(0)})建造更强(战力${targetPower.toFixed(0)})`,
-        };
-      }
+    // 拆建触发条件：
+    //  - 有己方孵化室（要拆的候选）
+    //  - 差距 ≥ 阈值
+    //  - 全局 demolish 冷却已过（10 游戏秒）
+    if (worst) {
+      const scoreGap = targetScore - worst.score;
+      const weakest = worst.hatchery;
+      const isDemolishOnCooldown =
+        now - this.lastDemolishGameTime <
+        DefaultAIDecisionMaker.HATCHERY_DEMOLISH_COOLDOWN_MS;
 
-      // 如果新模板不够强但有位置，直接建造（不要拆除）
-      if (availableBuildPositions.length > 0 && enemyFood >= targetCost) {
-        return {
-          action: 'build',
-          buildPosition: this.pickBuildPosition(availableBuildPositions),
-          buildTemplate: targetTemplate,
-          reason: '[迭代] 有空位，建造新孵化室',
-        };
-      }
-    }
-
-    // 位置充足时直接建造
-    if (availableBuildPositions.length > 1) {
-      if (enemyFood >= targetCost) {
-        return {
-          action: 'build',
-          buildPosition: this.pickBuildPosition(availableBuildPositions),
-          buildTemplate: targetTemplate,
-          reason: '[迭代] 有空位，建造新孵化室',
-        };
-      }
-    }
-
-    // 找不到需要替换的 → 开始升级
-    if (upgradableHatcheries.length > 0) {
-      const sorted = [...upgradableHatcheries].sort((a, b) => b.cost - a.cost);
-      for (const hatchery of sorted) {
-        if (enemyFood >= hatchery.cost) {
+      if (scoreGap >= DefaultAIDecisionMaker.SCORE_GAP_THRESHOLD) {
+        if (isDemolishOnCooldown) {
+          // 冷却期内：跳过 demolish，但不动 cooldown。
+          // 函数会继续往下走，可能执行 build / upgrade / wait。
+          const remainingMs = DefaultAIDecisionMaker.HATCHERY_DEMOLISH_COOLDOWN_MS
+            - (now - this.lastDemolishGameTime);
+          console.log(
+            `[AI][demolish] cooldown, ${(remainingMs / 1000).toFixed(1)}s remaining (gameTime=${now})`,
+          );
+        } else {
+          // 写入全局 cooldown，然后执行 demolish
+          this.lastDemolishGameTime = now;
+          console.log(
+            `[AI][demolish] gameTime=${now} scoreGap=${scoreGap} worst.score=${worst.score} targetScore=${targetScore}`,
+          );
           return {
-            action: 'upgrade',
-            targetHatcheryId: hatchery.id,
-            reason: `[迭代] 阵容已优化，升级孵化室(等级${hatchery.level}→${hatchery.level + 1})`,
+            action: 'demolish',
+            targetHatcheryId: weakest.id,
+            reason: `[迭代] 拆除权重不匹配巢(score=${worst.score})→目标(score=${targetScore})差${scoreGap}`,
           };
         }
       }
     }
 
-    return { action: 'wait', reason: '[迭代] 资源不足' };
+    // ④ 有空位且食物够 → 按权重采样建造（用 selectTemplate 保持多样性）
+    if (availableBuildPositions.length > 0 && enemyFood >= targetCost) {
+      const buildTemplate = this.selectTemplate(
+        availableHeads,
+        availableThoraxes,
+        availableAbdomens,
+      );
+      return {
+        action: 'build',
+        buildPosition: this.pickBuildPosition(availableBuildPositions),
+        buildTemplate,
+        reason: `[迭代] 有空位，建造新孵化室(score=${this.scoreTemplateByWeights(buildTemplate)})`,
+      };
+    }
+
+    // ⑤ 实在没得拆也没得建 → 升级"最不匹配 weights"的孵化室
+    // 旧实现：按 cost 倒序升级（纯数值堆叠，与 weights 无关）
+    // 新实现：按 score 升序升级（优先升级"最该被重做但暂时没钱拆"的孵化室，
+    //         升级会提升 levelMultiplier 间接影响后续迭代判断）
+    if (upgradableHatcheries.length > 0) {
+      const sorted = [...upgradableHatcheries].sort(
+        (a, b) => this.scoreHatcheryByWeights(a) - this.scoreHatcheryByWeights(b),
+      );
+      for (const hatchery of sorted) {
+        if (enemyFood >= hatchery.cost) {
+          return {
+            action: 'upgrade',
+            targetHatcheryId: hatchery.id,
+            reason: `[迭代] 升级低权重匹配的孵化室(score=${this.scoreHatcheryByWeights(hatchery)})`,
+          };
+        }
+      }
+    }
+
+    return { action: 'wait', reason: '[迭代] 资源不足或无可操作孵化室' };
+  }
+
+  /**
+   * 评估一个孵化室与当前 weights 的匹配度
+   * = 该孵化室三段部件在 weights 中对应的权重之和
+   *
+   * 范围：0 ~ 15（每段 max=5，三段共 max=15）
+   * 得分越高代表越匹配当前 LLM 战略权重 → 不应拆除
+   * 得分越低代表越不匹配 → 应优先拆除
+   */
+  private scoreHatcheryByWeights(h: Hatchery): number {
+    const w = this.weights;
+    return (
+      (w.heads[h.template.head] ?? 0) +
+      (w.thoraxes[h.template.thorax] ?? 0) +
+      (w.abdomens[h.template.abdomen] ?? 0)
+    );
+  }
+
+  /**
+   * 评估一个模板与当前 weights 的匹配度（同上但参数是 AntTemplate）
+   */
+  private scoreTemplateByWeights(t: AntTemplate): number {
+    const w = this.weights;
+    return (
+      (w.heads[t.head] ?? 0) +
+      (w.thoraxes[t.thorax] ?? 0) +
+      (w.abdomens[t.abdomen] ?? 0)
+    );
+  }
+
+  /**
+   * 按 weights 取每段部件的最高权重变体（确定性 top1）
+   * 用于"应该往这个方向迭代"的判断；与 selectTemplate 的随机采样职责分离。
+   *
+   * - 每段独立取 weights 中权重大于 0 的最高权重变体
+   * - 全部权重为 0 时退化为均匀随机（与 weightedChoice 一致）
+   */
+  private pickBestTemplateByWeights(
+    heads: HeadVariant[],
+    thoraxes: ThoraxVariant[],
+    abdomens: AbdomenVariant[],
+  ): AntTemplate {
+    const pickTop = <T extends string>(
+      candidates: T[],
+      weightMap: Record<string, number>,
+    ): T => {
+      const withW = candidates
+        .map((c) => ({ c, w: weightMap[c] ?? 0 }))
+        .filter((e) => e.w > 0)
+        .sort((a, b) => b.w - a.w);
+      if (withW.length > 0) return withW[0].c;
+      // 兜底：均匀随机
+      return candidates[Math.floor(Math.random() * candidates.length)];
+    };
+    return {
+      head: pickTop(heads, this.weights.heads as Record<string, number>),
+      thorax: pickTop(thoraxes, this.weights.thoraxes as Record<string, number>),
+      abdomen: pickTop(abdomens, this.weights.abdomens as Record<string, number>),
+    };
+  }
+
+  /**
+   * 重置 demolish cooldown（新对局立即允许拆除）
+   */
+  public resetDemolishCooldown(): void {
+    this.lastDemolishGameTime = -Infinity;
   }
 
   /**
@@ -306,23 +530,53 @@ export class DefaultAIDecisionMaker implements AIDecisionMaker {
   }
 
   /**
-   * 选择蚂蚁模板
+   * 选择蚂蚁模板：基于 weights 加权采样
    */
   private selectTemplate(
     heads: HeadVariant[],
     thoraxes: ThoraxVariant[],
     abdomens: AbdomenVariant[],
   ): AntTemplate {
-    // 如果有首选模板，直接使用
+    // 1. preferredTemplate 仍然有最高优先级
     if (this.preferredTemplate) {
       return { ...this.preferredTemplate };
     }
-    // 否则随机
+    // 2. 否则按权重采样
     return {
-      head: this.randomChoice(heads),
-      thorax: this.randomChoice(thoraxes),
-      abdomen: this.randomChoice(abdomens),
+      head: this.weightedChoice(heads, this.weights.heads as Record<string, number>),
+      thorax: this.weightedChoice(thoraxes, this.weights.thoraxes as Record<string, number>),
+      abdomen: this.weightedChoice(abdomens, this.weights.abdomens as Record<string, number>),
     };
+  }
+
+  /**
+   * 加权随机选择：从 candidates 中按 weightMap 抽样
+   * - weightMap 缺失或为 0 → 该项不参与
+   * - 所有项权重都是 0 或 weightMap 为空 → 退化为均匀随机
+   */
+  private weightedChoice<T extends string>(
+    candidates: T[],
+    weightMap: Record<string, number>,
+  ): T {
+    const entries: { key: T; weight: number }[] = [];
+    let total = 0;
+    for (const c of candidates) {
+      const w = weightMap[c];
+      if (typeof w === 'number' && w > 0) {
+        entries.push({ key: c, weight: w });
+        total += w;
+      }
+    }
+    if (total <= 0 || entries.length === 0) {
+      // 没有有效权重 → 退化为均匀随机
+      return candidates[Math.floor(Math.random() * candidates.length)];
+    }
+    let r = Math.random() * total;
+    for (const e of entries) {
+      r -= e.weight;
+      if (r <= 0) return e.key;
+    }
+    return entries[entries.length - 1].key;
   }
 
   /**
@@ -374,6 +628,47 @@ function getDistance(x1: number, y1: number, x2: number, y2: number): number {
   return Math.sqrt(dx * dx + dy * dy);
 }
 
+/**
+ * 按 (head, thorax, abdomen) 三元组聚合指定阵营的存活蚂蚁，
+ * 输出兵种构成列表（含数量与对应孵化室最高等级）。
+ *
+ * 内部辅助函数，用于 getBattleContext() 喂给战略顾问。
+ * 仅聚合 state !== 'dead' 的蚂蚁；不在该阵营孵化室里的蚂蚁（理论不应发生）忽略。
+ */
+function computeComposition(
+  ants: Ant[],
+  hatcheries: Hatchery[],
+  side: Side,
+): AntCompositionEntry[] {
+  // 孵化室 id -> 等级，用于反查蚂蚁来源孵化室
+  const hatchLevel = new Map<string, number>();
+  for (const h of hatcheries) {
+    if (h.side === side) hatchLevel.set(h.id, h.level);
+  }
+
+  // (h|t|a) -> { count, maxLv }
+  const map = new Map<string, AntCompositionEntry>();
+  for (const ant of ants) {
+    if (ant.side !== side || ant.state === 'dead') continue;
+    const lv = hatchLevel.get(ant.hatcheryId) ?? 1;
+    const h = ant.parts.head.variant as HeadVariant;
+    const t = ant.parts.thorax.variant as ThoraxVariant;
+    const a = ant.parts.abdomen.variant as AbdomenVariant;
+    const key = `${h}|${t}|${a}`;
+    const entry = map.get(key);
+    if (entry) {
+      entry.count += 1;
+      if (lv > entry.maxLv) entry.maxLv = lv;
+    } else {
+      map.set(key, { h, t, a, count: 1, maxLv: lv });
+    }
+  }
+
+  // 数量降序，最多返回 6 个模板（其余归并为"其他"，避免 LLM 提示过长）
+  const entries = Array.from(map.values()).sort((x, y) => y.count - x.count);
+  return entries.slice(0, 6);
+}
+
 // 计算从点1到点2的角度
 function getAngle(x1: number, y1: number, x2: number, y2: number): number {
   return Math.atan2(y2 - y1, x2 - x1);
@@ -415,6 +710,13 @@ export class GameEngine {
   // AI 决策间隔（毫秒）
   private aiDecisionInterval = 2000;
 
+  // LLM 战略顾问（可注入；每 ~60s 调一次，写入 DefaultAIDecisionMaker 的 mode + weights）
+  private strategicAdvisor: IStrategicAdvisor | null = null;
+  /** 上次调用战略顾问时的游戏时间（ms）。基于 gameTime 而非真实时间，暂停时不走。 */
+  private lastAdvisorGameTime = 0;
+  /** 顾问触发间隔（游戏时间，ms）。60 游戏秒 = 1x 速 60s，3x 速 20s 真实秒 */
+  private static readonly ADVISOR_INTERVAL_MS = 60_000;
+
   // 尾针甩尾事件列表（渲染器消费后清除）
   public stingerStrikeEvents: StingerStrikeEvent[] = [];
 
@@ -432,7 +734,7 @@ export class GameEngine {
   private enemyQueenAttackCooldown = 0;      // 敌方蚁后攻击冷却 (ms)
 
   // 赛后总结标记（防止重复调用）
-  private postGameSummarized = false;
+  private _postGameSummarized = false;
 
   constructor() {
     this.lastFoodTime = Date.now();
@@ -444,6 +746,38 @@ export class GameEngine {
    */
   setAIDecisionMaker(decisionMaker: AIDecisionMaker) {
     this.aiDecisionMaker = decisionMaker;
+  }
+
+  /**
+   * 设置战略顾问（如 DeepSeek）。每 ~60s 调 advise()，把 mode + weights 写入默认 AI。
+   * 传 null 卸载。
+   */
+  setStrategicAdvisor(advisor: IStrategicAdvisor | null): void {
+    this.strategicAdvisor = advisor;
+    // 重置计时器让新顾问能尽快首次执行
+    this.lastAdvisorGameTime = 0;
+  }
+
+  /**
+   * 外部告知引擎"顾问已经被调用过一次"，请把 lastAdvisorGameTime 推到当前游戏时间。
+   * 配合 setStrategicAdvisor() 一起用，避免外部首次拉取和引擎自带首次触发撞车。
+   */
+  markAdvisorCalled(): void {
+    try {
+      this.lastAdvisorGameTime = useGameStore.getState().stats.gameTime;
+    } catch {
+      this.lastAdvisorGameTime = 0;
+    }
+  }
+
+  /**
+   * 获取当前默认 AI 决策器（用于外部更新 mode / weights）
+   */
+  getDefaultAIDecisionMaker(): DefaultAIDecisionMaker | null {
+    if (this.aiDecisionMaker instanceof DefaultAIDecisionMaker) {
+      return this.aiDecisionMaker;
+    }
+    return null;
   }
 
   /**
@@ -479,6 +813,10 @@ export class GameEngine {
       state.enemyFood >= h.cost
     );
 
+    // 按阵营 + (h,t,a) 三元组聚合存活蚂蚁，附带孵化室等级
+    const enemyComposition = computeComposition(state.ants, state.hatcheries, 'enemy');
+    const playerComposition = computeComposition(state.ants, state.hatcheries, 'player');
+
     return {
       enemyFood: state.enemyFood,
       playerFood: state.playerFood,
@@ -490,6 +828,8 @@ export class GameEngine {
       playerHatcheries,
       enemyAntsCount: state.ants.filter(a => a.side === 'enemy' && a.state !== 'dead').length,
       playerAntsCount: state.ants.filter(a => a.side === 'player' && a.state !== 'dead').length,
+      enemyComposition,
+      playerComposition,
       availableBuildPositions,
       upgradableHatcheries,
       gameTime: state.stats.gameTime,
@@ -512,6 +852,9 @@ export class GameEngine {
     }
 
     const refund = state.demolishHatchery(hatcheryId);
+    if (refund > 0) {
+      playSound.hatchery('demolish');
+    }
     return {
       success: true,
       refund,
@@ -539,6 +882,9 @@ export class GameEngine {
     }
 
     const success = state.upgradeHatchery(hatcheryId);
+    if (success) {
+      playSound.hatchery('upgrade');
+    }
     return {
       success,
       reason: success ? `成功升级到 ${hatchery.level + 1} 级` : '升级失败'
@@ -561,6 +907,9 @@ export class GameEngine {
     }
 
     const hatchery = state.buildHatchery('enemy', gridPos, template);
+    if (hatchery) {
+      playSound.hatchery('build');
+    }
     return {
       success: !!hatchery,
       reason: hatchery ? '建造成功' : '建造失败'
@@ -604,15 +953,21 @@ export class GameEngine {
     this.lastFoodTime = Date.now();
     this.lastAIDecisionTime = Date.now();
     this.lastUnlockGameTime = 0;
+    // 重置战略顾问计时器（新一局让顾问能尽快首次执行）
+    this.lastAdvisorGameTime = 0;
     // 重置蚁后攻击冷却
     this.playerQueenAttackCooldown = 0;
     this.enemyQueenAttackCooldown = 0;
     // 重置赛后总结标记
-    this.postGameSummarized = false;
+    this._postGameSummarized = false;
     // 重置常规 AI 的模式和模板
     if (this.aiDecisionMaker instanceof DefaultAIDecisionMaker) {
       this.aiDecisionMaker.mode = 'iterate';
       this.aiDecisionMaker.preferredTemplate = null;
+      // 同时清空权重（新一局从均匀随机开始，等顾问下一轮再调整）
+      this.aiDecisionMaker.weights = { heads: {}, thoraxes: {}, abdomens: {} };
+      // 重置 demolish cooldown（新一局允许立即拆建）
+      this.aiDecisionMaker.resetDemolishCooldown();
     }
   }
 
@@ -646,6 +1001,10 @@ export class GameEngine {
 
     // AI 决策与执行（建造/升级/拆除）
     this.handleAIDecision();
+
+    // 战略顾问（每 ~60s 调一次 LLM，调整 mode + weights）
+    // 独立于 handleAIDecision 的 2s 节流，每帧都检查
+    this.maybeAdvise();
 
     // 孵化室生产蚂蚁
     this.handleHatcherySpawning(deltaTime);
@@ -921,6 +1280,9 @@ export class GameEngine {
       time: performance.now(),
     });
 
+    // 播放尾针音效
+    playSound.ability('stinger');
+
     console.log(`[马塔贝勒蚁] ${attacker.side}方蚂蚁尾针命中！减速50%攻速，中毒${poisonTotalDamage}伤害/${poisonDuration / 1000}秒`);
   }
 
@@ -972,7 +1334,7 @@ export class GameEngine {
 
   /**
    * 处理嘲讽技能（切叶蚁胸）
-   * 在战斗中自动触发，迫使范围内敌人攻击自己，回复生命，获得护甲buff
+   * 生命值低于20%时触发，迫使范围内敌人攻击自己，回复生命，获得护甲buff
    */
   private handleTauntAbility() {
     const state = useGameStore.getState();
@@ -980,10 +1342,11 @@ export class GameEngine {
     for (const ant of state.ants) {
       // 跳过不符合条件的蚂蚁
       if (ant.state === 'dead' || !ant.hasTauntAbility || ant.tauntCooldown > 0) continue;
-      // 只在战斗状态触发
-      if (ant.state !== 'fighting') continue;
 
-      const { tauntRadius, healPercent, armorBuffValue, armorBuffDuration, cooldown } = TAUNT_ABILITY_CONFIG;
+      // 触发条件：生命值低于20%
+      const { tauntRadius, healPercent, armorBuffValue, armorBuffDuration, cooldown, triggerThreshold } = TAUNT_ABILITY_CONFIG;
+      const hpPercent = ant.hp / ant.maxHp;
+      if (hpPercent > triggerThreshold) continue;
 
       // 找到范围内的敌方蚂蚁
       const enemiesInRange: Ant[] = [];
@@ -1038,7 +1401,10 @@ export class GameEngine {
         state.updateAnts(tauntUpdates);
       }
 
-      console.log(`[切叶蚁] ${ant.side}方蚂蚁嘲讽！吸引${enemiesInRange.length}个敌人，恢复${healAmount}HP，获得80%护甲5秒`);
+      // 播放嘲讽音效
+      playSound.ability('taunt');
+
+      console.log(`[切叶蚁] ${ant.side}方蚂蚁生命低于20%触发嘲讽！吸引${enemiesInRange.length}个敌人，恢复${healAmount}HP，获得80%护甲5秒`);
     }
   }
 
@@ -1230,7 +1596,7 @@ export class GameEngine {
     // 获取战场态势
     const context = this.getBattleContext();
 
-    // 获取 AI 决策（模式和模板已由 Gemini 设定在 DefaultAIDecisionMaker 中）
+    // 获取 AI 决策（模式由战略层设定、权重由加权采样部件组合）
     const decision = this.aiDecisionMaker.makeDecision(context);
 
     // 执行决策
@@ -1238,11 +1604,51 @@ export class GameEngine {
   }
 
   /**
+   * ~60 游戏秒节奏触发战略顾问。顾问输出的 mode + weights 写入 DefaultAI。
+   * - 基于 gameTime 而非真实时间，所以暂停时不走、3x 速时约 20 真实秒一次。
+   * - 不阻塞主循环；失败回退到当前 DefaultAI 的状态。
+   */
+  private maybeAdvise(): void {
+    if (!this.strategicAdvisor) return;
+    const state = useGameStore.getState();
+    const gameTime = state.stats.gameTime;
+    if (gameTime - this.lastAdvisorGameTime < GameEngine.ADVISOR_INTERVAL_MS) return;
+    this.lastAdvisorGameTime = gameTime;
+
+    const ctx = this.getBattleContext();
+    const defaultAI = this.getDefaultAIDecisionMaker();
+    if (!defaultAI) {
+      // 当前 AI 决策器不是 DefaultAIDecisionMaker，战略指令无法落地
+      console.warn('[StrategicAdvisor] 当前 AI 不是 DefaultAIDecisionMaker，战略指令被丢弃');
+      return;
+    }
+
+    this.strategicAdvisor
+      .advise(ctx)
+      .then((directive) => {
+        if (!directive) return;
+        defaultAI.mode = directive.mode;
+        defaultAI.setWeights(directive.weights);
+        if (directive.taunt) {
+          try {
+            useGameStore.getState().setAITrashTalk(directive.taunt);
+          } catch {
+            /* ignore */
+          }
+        }
+        console.log(
+          `[StrategicAdvisor] mode=${directive.mode} taunt="${directive.taunt || ''}"`,
+        );
+      })
+      .catch((err) => {
+        console.warn('[StrategicAdvisor] advise 失败:', err);
+      });
+  }
+
+  /**
    * 执行 AI 决策
    */
   private executeAIDecision(decision: AIDecision) {
-    const state = useGameStore.getState();
-
     switch (decision.action) {
       case 'build':
         if (decision.buildPosition && decision.buildTemplate) {
@@ -1305,13 +1711,18 @@ export class GameEngine {
           ant => ant.hatcheryId === hatchery.id && ant.state !== 'dead'
         ).length;
 
+        // 火蚁头允许同孵化室多容纳一只（最多2只）
+        const hatcheryMax = hatchery.template.head === 'fire' ? 2 : maxAntsPerHatchery;
+
         // 如果存活蚂蚁数量已达上限，跳过生产（但不重置冷却时间）
-        if (aliveAntsFromHatchery >= maxAntsPerHatchery) {
+        if (aliveAntsFromHatchery >= hatcheryMax) {
           continue;
         }
 
         // 生产蚂蚁
         updatedState.spawnAntFromHatchery(hatchery);
+        // 播放孵化音效
+        playSound.spawn(hatchery.side);
 
         // 重置冷却时间（使用动态孵化间隔）
         useGameStore.setState((s) => ({
@@ -1375,7 +1786,8 @@ export class GameEngine {
       if (nearestDistance <= effectiveAttackRange) {
         if (ant.isRanged) {
           // 远程蚂蚁进入射击状态
-          if (ant.state !== 'shooting') {
+          const currentState = ant.state as string;
+          if (currentState !== 'shooting') {
             updates.push({
               id: ant.id,
               changes: { state: 'shooting', targetId: nearestEnemy.id },
@@ -1383,7 +1795,8 @@ export class GameEngine {
           }
         } else {
           // 近战蚂蚁进入战斗状态
-          if (ant.state !== 'fighting') {
+          const currentState = ant.state as string;
+          if (currentState !== 'fighting') {
             updates.push({
               id: ant.id,
               changes: { state: 'fighting', targetId: nearestEnemy.id },
@@ -1721,6 +2134,8 @@ export class GameEngine {
           });
 
           console.log(`[大头蚁] ${ant.side}方蚂蚁触发秒杀！甩飞敌人！`);
+          // 播放秒杀音效
+          playSound.ability('execution');
 
           // 保存攻击者ID用于延迟回调
           const attackerId = ant.id;
@@ -1743,9 +2158,14 @@ export class GameEngine {
           continue; // 秒杀时跳过普通伤害
         }
 
-        // 计算护甲减伤后的实际伤害
+        // 计算护甲减伤后的实际伤害（先百分比减伤，再固定值减伤）
         const armorMultiplier = this.getArmorMultiplier(target);
-        const actualDamage = Math.max(1, Math.floor(ant.damage * armorMultiplier));
+        let baseDamage = Math.floor(ant.damage * armorMultiplier);
+        // 暴击判定（切叶蚁头部）
+        if (ant.critChance > 0 && Math.random() < ant.critChance) {
+          baseDamage *= 3;
+        }
+        const actualDamage = Math.max(1, baseDamage - target.flatArmor);
         const newTargetHp = target.hp - actualDamage;
 
         updates.push({
@@ -1839,12 +2259,16 @@ export class GameEngine {
       // 玩家蚂蚁到达敌方蚁后
       if (ant.side === 'player' && ant.position.x >= QUEEN_CONFIG.enemyPosition.x - 30) {
         state.damageQueen('enemy', queenDamage);
+        // 播放蚁后受伤音效
+        playSound.queen('damage');
         toRemove.push(ant.id);
       }
 
       // 敌方蚂蚁到达玩家蚁后
       if (ant.side === 'enemy' && ant.position.x <= QUEEN_CONFIG.playerPosition.x + 30) {
         state.damageQueen('player', queenDamage);
+        // 播放蚁后受伤音效
+        playSound.queen('damage');
         toRemove.push(ant.id);
       }
     }
@@ -1901,6 +2325,8 @@ export class GameEngine {
       });
 
       if (healedAntIds.length > 0) {
+        // 播放蜜罐爆炸音效
+        playSound.ability('honeypot');
         console.log(`[蜜罐蚁] ${deadAnt.side}方蚂蚁死亡爆炸！回复${healedAntIds.length}个友军各${healAmount}HP`);
       }
     }
@@ -1915,6 +2341,8 @@ export class GameEngine {
     const deadAnts = state.ants.filter(a => a.state === 'dead');
 
     for (const ant of deadAnts) {
+      // 播放死亡音效
+      playSound.death(ant.side);
       // 清理已处理的蜜罐爆炸记录
       this.processedHoneypotDeaths.delete(ant.id);
       state.removeAnt(ant.id);
@@ -1986,6 +2414,9 @@ export class GameEngine {
 
       // 记录逃脱的蚂蚁ID
       escapedAntIds.push(ant.id);
+
+      // 播放逃脱音效
+      playSound.ability('escape');
 
       console.log(`[大齿猛蚁] ${ant.side}方蚂蚁触发弹射逃脱！恢复 ${healAmount} HP (${ant.hp} → ${newHp})/${ant.maxHp}`);
     }
@@ -2194,9 +2625,10 @@ export class GameEngine {
 
       // 处理命中
       if (hitTarget) {
-        // 计算护甲减伤后的实际伤害
+        // 计算护甲减伤后的实际伤害（先百分比减伤，再固定值减伤）
         const armorMultiplier = this.getArmorMultiplier(hitTarget);
-        const actualDamage = Math.max(1, Math.floor(projectile.damage * armorMultiplier));
+        const percentDamage = Math.floor(projectile.damage * armorMultiplier);
+        const actualDamage = Math.max(1, percentDamage - hitTarget.flatArmor);
         const newHp = hitTarget.hp - actualDamage;
 
         antUpdates.push({

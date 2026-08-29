@@ -8,3 +8,5 @@ export { AssemblyPanel } from './AssemblyPanel';
 export { BuildPanel } from './BuildPanel';
 export { UnlockNotifications } from './UnlockNotifications';
 export { AITrashTalk } from './AITrashTalk';
+export { SoundControl, playSound } from './SoundControl';
+export { SettingsPanel, APIKeyHint } from './SettingsPanel';

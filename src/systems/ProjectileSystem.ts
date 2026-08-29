@@ -8,7 +8,8 @@ import type { Ant, Projectile } from '../types';
 import { v4 as uuidv4 } from 'uuid';
 import { GameEvents } from '../core/Events';
 import { SPITTER_SLOW_CONFIG, RANGED_CONFIG } from '../config/partStats';
-import { QUEEN_CONFIG, QUEEN_ATTACK_CONFIG } from '../config/gameConfig';
+import { QUEEN_ATTACK_CONFIG } from '../config/gameConfig';
+import { playSound } from '../components/SoundControl';
 
 // 工具函数
 function getDistance(x1: number, y1: number, x2: number, y2: number): number {
@@ -22,7 +23,7 @@ function getAngle(x1: number, y1: number, x2: number, y2: number): number {
 }
 
 export class ProjectileSystem {
-  constructor() {}
+  constructor() { }
 
   /**
    * 更新投射物系统
@@ -34,29 +35,29 @@ export class ProjectileSystem {
   /**
    * 重置系统
    */
-  reset(): void {}
+  reset(): void { }
 
   /**
    * 销毁系统
    */
-  destroy(): void {}
+  destroy(): void { }
 
   /**
    * 发射远程子弹
    */
   fireProjectile(shooter: Ant, target: Ant): void {
     const state = useGameStore.getState();
-    
+
     const offsetX = Math.cos(shooter.rotation) * 15;
     const offsetY = Math.sin(shooter.rotation) * 15;
-    
+
     const angle = getAngle(
       shooter.position.x, shooter.position.y,
       target.position.x, target.position.y
     );
-    
+
     const slowValue = SPITTER_SLOW_CONFIG.slowByLevel[shooter.sourceLevel - 1] || 0;
-    
+
     const projectile: Projectile = {
       id: uuidv4(),
       side: shooter.side,
@@ -74,9 +75,11 @@ export class ProjectileSystem {
         duration: SPITTER_SLOW_CONFIG.duration,
       } : undefined,
     };
-    
+
     state.addProjectile(projectile);
     GameEvents.emitProjectileFire(projectile);
+    // 播放远程攻击音效
+    playSound.attack(true);
   }
 
   /**
@@ -112,41 +115,41 @@ export class ProjectileSystem {
   private updateProjectiles(deltaTime: number): void {
     const state = useGameStore.getState();
     const projectiles = state.projectiles;
-    
+
     if (projectiles.length === 0) return;
-    
+
     const toRemove: string[] = [];
     const antUpdates: { id: string; changes: Partial<Ant> }[] = [];
     const projectileUpdates: { id: string; changes: Partial<Projectile> }[] = [];
-    
+
     for (const projectile of projectiles) {
       const moveX = Math.cos(projectile.rotation) * projectile.speed * deltaTime;
       const moveY = Math.sin(projectile.rotation) * projectile.speed * deltaTime;
-      
+
       const newX = projectile.position.x + moveX;
       const newY = projectile.position.y + moveY;
-      
+
       // 检查是否超出地图边界
       if (newX < 0 || newX > 1800 || newY < 0 || newY > 600) {
         toRemove.push(projectile.id);
         continue;
       }
-      
+
       const target = state.ants.find(a => a.id === projectile.targetId);
       let hitTarget: Ant | null = null;
-      
+
       if (target && target.state !== 'dead' && !target.isExecuting && !target.isBeingExecuted) {
         const distToTarget = getDistance(newX, newY, target.position.x, target.position.y);
         if (distToTarget <= 15) {
           hitTarget = target;
         }
       }
-      
+
       if (!hitTarget) {
-        const enemies = state.ants.filter(a => 
+        const enemies = state.ants.filter(a =>
           a.side !== projectile.side && a.state !== 'dead' && !a.isExecuting && !a.isBeingExecuted
         );
-        
+
         for (const enemy of enemies) {
           const dist = getDistance(newX, newY, enemy.position.x, enemy.position.y);
           if (dist <= 15) {
@@ -155,17 +158,18 @@ export class ProjectileSystem {
           }
         }
       }
-      
+
       if (hitTarget) {
         const armorMultiplier = this.getArmorMultiplier(hitTarget);
-        const actualDamage = Math.max(1, Math.floor(projectile.damage * armorMultiplier));
+        const percentDamage = Math.floor(projectile.damage * armorMultiplier);
+        const actualDamage = Math.max(1, percentDamage - hitTarget.flatArmor);
         const newHp = hitTarget.hp - actualDamage;
-        
+
         antUpdates.push({
           id: hitTarget.id,
           changes: { hp: newHp },
         });
-        
+
         if (newHp <= 0) {
           antUpdates.push({
             id: hitTarget.id,
@@ -175,25 +179,25 @@ export class ProjectileSystem {
           // 减速效果需要通过 BuffSystem 处理，这里只是记录事件
           GameEvents.emitProjectileHit(projectile, hitTarget.id, actualDamage);
         }
-        
+
         toRemove.push(projectile.id);
         continue;
       }
-      
+
       projectileUpdates.push({
         id: projectile.id,
         changes: { position: { x: newX, y: newY } },
       });
     }
-    
+
     if (antUpdates.length > 0) {
       state.updateAnts(antUpdates);
     }
-    
+
     if (projectileUpdates.length > 0) {
       state.updateProjectiles(projectileUpdates);
     }
-    
+
     for (const id of toRemove) {
       state.removeProjectile(id);
     }

@@ -116,11 +116,12 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   };
 
   return (
-    <div className="relative">
-      {/* PixiJS 画布容器 */}
+    <div className="relative w-full h-full flex items-center justify-center bg-black overflow-auto">
+      {/* PixiJS 画布容器 - 固定游戏尺寸，允许滚动 */}
       <div
         ref={containerRef}
-        className="rounded-lg overflow-hidden border-2 border-bio-primary/30 shadow-neon-green"
+        className="rounded-lg overflow-auto border-2 border-bio-primary/30 shadow-neon-green"
+        style={{ width: 1800, height: 600 }}
       />
 
       {/* 游戏控制覆盖层 */}

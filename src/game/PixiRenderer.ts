@@ -4,11 +4,11 @@
  */
 
 import * as PIXI from 'pixi.js';
-import type { Ant, Side, Hatchery, Projectile, HeadVariant, ThoraxVariant, AbdomenVariant } from '../types';
-import { useGameStore } from '../store/gameStore';
+import type { Ant, Side, Hatchery, Projectile, GridPosition, AntTemplate, HeadVariant, ThoraxVariant, AbdomenVariant } from '../types';
+import { useGameStore, calculateHatcheryCost } from '../store/gameStore';
 import { GAME_CONFIG, QUEEN_CONFIG, COLORS, BUILD_ZONE } from '../config/gameConfig';
 import { HONEYPOT_EXPLOSION_CONFIG, STINGER_ANIM_CONFIG, getHeadConfig, getThoraxConfig, getAbdomenConfig } from '../config/partStats';
-import { getGameEngine, type HoneypotExplosionEvent, type StingerStrikeEvent } from './GameEngine';
+import { getGameEngine } from './GameEngine';
 
 // 部件颜色配置 - 根据部件类型使用不同的色系
 // 头部：暖色系（影响攻击力）
@@ -129,6 +129,13 @@ export class PixiRenderer {
   private battleLine: PIXI.Graphics | null = null;
   private buildZoneGraphics: PIXI.Graphics | null = null;
 
+  // 基地建造格子（每个格子独立 sprite，便于交互）
+  // key = `${side}-${col}-${row}`
+  private gridSprites: Map<string, PIXI.Container> = new Map();
+  // 当前悬停的格子（用于 hover 0.5s 延迟显示 tooltip）
+  private hoveredGridKey: string | null = null;
+  private hoveredGridTimer: number | null = null;
+
   // 中毒粒子系统
   private poisonParticles: Map<string, PoisonParticle[]> = new Map();
   private lastParticleTime: number = 0;
@@ -144,11 +151,10 @@ export class PixiRenderer {
   private healParticleGroups: HealParticleGroup[] = [];
   private healParticleGraphics: PIXI.Graphics | null = null;
 
-  // 孵化室悬浮提示
+  // 格子悬浮提示（共用容器，由 showGridTooltip 渲染）
   private tooltipContainer: PIXI.Container | null = null;
   private tooltipBg: PIXI.Graphics | null = null;
   private tooltipText: PIXI.Text | null = null;
-  private hoveredHatcheryId: string | null = null;
 
   constructor(app: PIXI.Application) {
     this.app = app;
@@ -169,10 +175,10 @@ export class PixiRenderer {
     this.drawGround();
     this.app.stage.addChild(this.groundGraphics);
 
-    // 创建建造区域
+    // 创建建造区域（每个格子独立 sprite，支持点击和 hover）
     this.buildZoneGraphics = new PIXI.Graphics();
-    this.drawBuildZones();
     this.app.stage.addChild(this.buildZoneGraphics);
+    this.setupBuildZoneCells();
 
     // 创建战线标记
     this.battleLine = new PIXI.Graphics();
@@ -203,7 +209,8 @@ export class PixiRenderer {
   }
 
   /**
-   * 创建孵化室悬浮提示容器
+   * 创建格子悬浮提示容器
+   * （注：信息统一由 showGridTooltip 提供，悬停孵化室不再走单独路径）
    */
   private setupTooltip() {
     this.tooltipContainer = new PIXI.Container();
@@ -222,64 +229,6 @@ export class PixiRenderer {
     this.tooltipContainer.addChild(this.tooltipText);
 
     this.app.stage.addChild(this.tooltipContainer);
-  }
-
-  /**
-   * 显示孵化室悬浮提示（鼠标悬停时）
-   */
-  private showHatcheryTooltip(hatcheryId: string, sprite: PIXI.Container) {
-    if (!this.tooltipContainer || !this.tooltipText || !this.tooltipBg) return;
-
-    const state = useGameStore.getState();
-    const hatchery = state.hatcheries.find(h => h.id === hatcheryId);
-    if (!hatchery) return;
-
-    // 查找部件中文名称
-    const headName = getHeadConfig(hatchery.template.head).nameCN;
-    const thoraxName = getThoraxConfig(hatchery.template.thorax).nameCN;
-    const abdomenName = getAbdomenConfig(hatchery.template.abdomen).nameCN;
-
-    const sideLabel = hatchery.side === 'player' ? '我方' : '敌方';
-    this.tooltipText.text = `${sideLabel}孵化室 Lv.${hatchery.level}\n头: ${headName}\n胸: ${thoraxName}\n腹: ${abdomenName}`;
-
-    // 重新绘制背景
-    const padding = 8;
-    const bgWidth = this.tooltipText.width + padding * 2;
-    const bgHeight = this.tooltipText.height + padding * 2;
-
-    this.tooltipBg.clear();
-    this.tooltipBg.beginFill(0x1a1a2e, 0.92);
-    this.tooltipBg.lineStyle(1, 0x888888, 0.6);
-    this.tooltipBg.drawRoundedRect(0, 0, bgWidth, bgHeight, 6);
-    this.tooltipBg.endFill();
-
-    this.tooltipText.position.set(padding, padding);
-
-    // 定位到孵化室上方
-    const halfGrid = GAME_CONFIG.gridSize / 2;
-    let x = sprite.position.x - bgWidth / 2;
-    let y = sprite.position.y - halfGrid - bgHeight - 5;
-
-    // 限制水平边界
-    x = Math.max(5, Math.min(GAME_CONFIG.mapWidth - bgWidth - 5, x));
-    // 如果上方空间不够，显示在下方
-    if (y < 5) {
-      y = sprite.position.y + halfGrid + 5;
-    }
-
-    this.tooltipContainer.position.set(x, y);
-    this.tooltipContainer.visible = true;
-    this.hoveredHatcheryId = hatcheryId;
-  }
-
-  /**
-   * 隐藏孵化室悬浮提示
-   */
-  private hideHatcheryTooltip() {
-    if (this.tooltipContainer) {
-      this.tooltipContainer.visible = false;
-    }
-    this.hoveredHatcheryId = null;
   }
 
   private drawGround() {
@@ -332,7 +281,6 @@ export class PixiRenderer {
     if (!this.groundGraphics) return;
 
     const colors = COLORS.antHill;
-    const accentColor = side === 'player' ? 0x4a3020 : 0x3a2520;
 
     // 基础深色地面
     this.groundGraphics.beginFill(colors.dark, 1);
@@ -372,7 +320,7 @@ export class PixiRenderer {
   /**
    * 绘制草地纹理
    */
-  private drawGrassTexture(x: number, y: number, width: number, height: number) {
+  private drawGrassTexture(x: number, _y: number, width: number, height: number) {
     if (!this.groundGraphics) return;
 
     // 草地深浅斑块
@@ -402,7 +350,7 @@ export class PixiRenderer {
   /**
    * 绘制过渡区域（蚁穴到草坪的渐变）
    */
-  private drawTransitionZone(x: number, y: number, width: number, height: number, direction: 'left' | 'right') {
+  private drawTransitionZone(x: number, y: number, width: number, height: number, _direction: 'left' | 'right') {
     if (!this.groundGraphics) return;
 
     const gradientSteps = 5;
@@ -419,36 +367,374 @@ export class PixiRenderer {
   }
 
   private drawBuildZones() {
-    if (!this.buildZoneGraphics) return;
-
-    this.buildZoneGraphics.clear();
-
-    const { gridSize, gridCols, gridRows } = GAME_CONFIG;
-
-    // 绘制玩家建造区
-    this.drawBuildZone(BUILD_ZONE.player.startX, BUILD_ZONE.player.startY, COLORS.player.primary);
-
-    // 绘制敌方建造区
-    this.drawBuildZone(BUILD_ZONE.enemy.startX, BUILD_ZONE.enemy.startY, COLORS.enemy.primary);
+    // 保留兼容入口：格子已改为独立 sprite，这里只更新视觉外观
+    this.refreshBuildZoneCells();
   }
 
-  private drawBuildZone(startX: number, startY: number, color: number) {
-    if (!this.buildZoneGraphics) return;
-
+  /**
+   * 初始化两侧基地的所有建造格子（每个格子一个 PIXI.Container，可交互）
+   */
+  private setupBuildZoneCells() {
     const { gridSize, gridCols, gridRows } = GAME_CONFIG;
 
-    // 绘制格子
-    for (let col = 0; col < gridCols; col++) {
-      for (let row = 0; row < gridRows; row++) {
-        const x = startX + col * gridSize;
-        const y = startY + row * gridSize;
+    const sides: Side[] = ['player', 'enemy'];
+    for (const side of sides) {
+      const zone = side === 'player' ? BUILD_ZONE.player : BUILD_ZONE.enemy;
+      const color = side === 'player' ? COLORS.player.primary : COLORS.enemy.primary;
 
-        // 格子背景
-        this.buildZoneGraphics.beginFill(COLORS.grid, 0.3);
-        this.buildZoneGraphics.lineStyle(1, color, 0.3);
-        this.buildZoneGraphics.drawRect(x, y, gridSize - 2, gridSize - 2);
-        this.buildZoneGraphics.endFill();
+      for (let col = 0; col < gridCols; col++) {
+        for (let row = 0; row < gridRows; row++) {
+          const key = `${side}-${col}-${row}`;
+          const x = zone.startX + col * gridSize;
+          const y = zone.startY + row * gridSize;
+
+          const cell = new PIXI.Container();
+          cell.position.set(x, y);
+          cell.name = 'gridCell';
+
+          // 格子背景
+          const bg = new PIXI.Graphics();
+          bg.name = 'bg';
+          this.drawGridCellShape(bg, color);
+          cell.addChild(bg);
+
+          // 模式提示符号（默认隐藏）
+          const hint = new PIXI.Graphics();
+          hint.name = 'hint';
+          hint.visible = false;
+          cell.addChild(hint);
+
+          // 玩家侧格子支持点击；敌方侧纯展示
+          if (side === 'player') {
+            cell.eventMode = 'static';
+            cell.cursor = 'pointer';
+            cell.hitArea = new PIXI.Rectangle(0, 0, gridSize, gridSize);
+
+            const gridPos: GridPosition = { col, row };
+            (cell as any).side = side;
+            (cell as any).gridPos = gridPos;
+            (cell as any).key = key;
+
+            cell.on('pointerover', () => this.handleGridHover(key));
+            cell.on('pointerout', () => this.handleGridHoverEnd(key));
+            cell.on('pointertap', () => this.handleGridClick(side, gridPos));
+          } else {
+            cell.eventMode = 'none';
+          }
+
+          this.app.stage.addChild(cell);
+          this.gridSprites.set(key, cell);
+        }
       }
+    }
+  }
+
+  /**
+   * 重绘格子背景（每次 store 变化时调用：根据 buildMode/是否有孵化室 调整外观）
+   */
+  private refreshBuildZoneCells() {
+    const state = useGameStore.getState();
+    const { gridSize, gridCols, gridRows } = GAME_CONFIG;
+    const buildMode = state.buildMode;
+    const canAfford = state.playerFood >= calculateHatcheryCost(state.playerTemplate);
+    const status = state.status;
+
+    for (const side of ['player', 'enemy'] as Side[]) {
+      const color = side === 'player' ? COLORS.player.primary : COLORS.enemy.primary;
+
+      for (let col = 0; col < gridCols; col++) {
+        for (let row = 0; row < gridRows; row++) {
+          const key = `${side}-${col}-${row}`;
+          const cell = this.gridSprites.get(key);
+          if (!cell) continue;
+
+          const bg = cell.getChildByName('bg') as PIXI.Graphics;
+          const hintGraphics = cell.getChildByName('hint') as PIXI.Graphics;
+          if (!bg || !hintGraphics) continue;
+
+          // 该格子是否已经有孵化室
+          const hasHatchery = state.hatcheries.some(
+            h => h.side === side && h.gridPos.col === col && h.gridPos.row === row,
+          );
+
+          bg.clear();
+          hintGraphics.clear();
+
+          if (hasHatchery) {
+            if (side === 'player') {
+              // 玩家侧已建孵化室：按 buildMode 与可操作性显示不同边框/中央符号
+              const hatchery = state.hatcheries.find(
+                h => h.side === side && h.gridPos.col === col && h.gridPos.row === row,
+              )!;
+              const isMaxLevel = hatchery.level >= state.config.maxHatcheryLevel;
+              const canAffordUpgrade = state.playerFood >= hatchery.cost;
+              const canUpgrade = !isMaxLevel && canAffordUpgrade;
+
+              if (buildMode === 'upgrade') {
+                if (isMaxLevel) {
+                  // 满级：紫色边框 + MAX 提示
+                  bg.lineStyle(2, 0xa855f7, 0.7);
+                  bg.beginFill(COLORS.grid, 0.08);
+                  bg.drawRect(1, 1, gridSize - 2, gridSize - 2);
+                  bg.endFill();
+                  hintGraphics.visible = true;
+                  hintGraphics.lineStyle(0);
+                  hintGraphics.beginFill(0xa855f7, 0.9);
+                  hintGraphics.drawRoundedRect(
+                    gridSize / 2 - 12, gridSize / 2 - 6, 24, 12, 3,
+                  );
+                  hintGraphics.endFill();
+                  hintGraphics.beginFill(0xffffff, 1);
+                  hintGraphics.drawRect(gridSize / 2 - 7, gridSize / 2 - 1, 14, 2);
+                  hintGraphics.drawRect(gridSize / 2 - 1, gridSize / 2 - 4, 2, 8);
+                } else if (canUpgrade) {
+                  // 可升级：金色脉冲边框 + ↑ 箭头
+                  const pulse = 0.5 + Math.sin(performance.now() / 333) * 0.35;
+                  bg.lineStyle(2, 0xfbbf24, pulse);
+                  bg.beginFill(COLORS.grid, 0.15);
+                  bg.drawRect(1, 1, gridSize - 2, gridSize - 2);
+                  bg.endFill();
+                  hintGraphics.visible = true;
+                  hintGraphics.lineStyle(2.5, 0xfbbf24, pulse);
+                  hintGraphics.moveTo(gridSize / 2, gridSize / 2 - 7);
+                  hintGraphics.lineTo(gridSize / 2 - 7, gridSize / 2 + 5);
+                  hintGraphics.lineTo(gridSize / 2 + 7, gridSize / 2 + 5);
+                  hintGraphics.lineTo(gridSize / 2, gridSize / 2 - 7);
+                } else {
+                  // 缺资源：灰色边框 + ✕ 提示
+                  bg.lineStyle(2, 0x6b7280, 0.6);
+                  bg.beginFill(COLORS.grid, 0.08);
+                  bg.drawRect(1, 1, gridSize - 2, gridSize - 2);
+                  bg.endFill();
+                  hintGraphics.visible = true;
+                  hintGraphics.lineStyle(2.5, 0x6b7280, 0.8);
+                  hintGraphics.moveTo(gridSize / 2 - 6, gridSize / 2 - 6);
+                  hintGraphics.lineTo(gridSize / 2 + 6, gridSize / 2 + 6);
+                  hintGraphics.moveTo(gridSize / 2 + 6, gridSize / 2 - 6);
+                  hintGraphics.lineTo(gridSize / 2 - 6, gridSize / 2 + 6);
+                }
+              } else if (buildMode === 'demolish') {
+                // 拆除模式：红色边框（始终可拆）
+                const pulse = 0.5 + Math.sin(performance.now() / 333) * 0.35;
+                bg.lineStyle(2, 0xef4444, pulse);
+                bg.beginFill(COLORS.grid, 0.15);
+                bg.drawRect(1, 1, gridSize - 2, gridSize - 2);
+                bg.endFill();
+                hintGraphics.visible = true;
+                hintGraphics.lineStyle(2.5, 0xef4444, pulse);
+                hintGraphics.moveTo(gridSize / 2 - 7, gridSize / 2 - 7);
+                hintGraphics.lineTo(gridSize / 2 + 7, gridSize / 2 + 7);
+                hintGraphics.moveTo(gridSize / 2 + 7, gridSize / 2 - 7);
+                hintGraphics.lineTo(gridSize / 2 - 7, gridSize / 2 + 7);
+              } else {
+                // 建造模式：保持背景淡化，让玩家看清孵化室本体
+                bg.lineStyle(1, color, 0.15);
+                bg.beginFill(COLORS.grid, 0.08);
+                bg.drawRect(1, 1, gridSize - 2, gridSize - 2);
+                bg.endFill();
+                hintGraphics.visible = false;
+              }
+            } else {
+              // 敌方已建孵化室：保持淡色填充（敌方格子纯展示，不响应点击）
+              bg.beginFill(COLORS.grid, 0.25);
+              bg.lineStyle(1, color, 0.3);
+              bg.drawRect(1, 1, gridSize - 2, gridSize - 2);
+              bg.endFill();
+              hintGraphics.visible = false;
+            }
+            continue;
+          }
+
+          // 空格视觉提示
+          if (side === 'player') {
+            if (buildMode === 'build' && canAfford && status === 'playing') {
+              // 可建造：亮边框 + 中心 "+" 提示
+              bg.beginFill(COLORS.grid, 0.35);
+              bg.lineStyle(1, color, 0.6);
+              bg.drawRect(1, 1, gridSize - 2, gridSize - 2);
+              bg.endFill();
+              hintGraphics.visible = true;
+              hintGraphics.lineStyle(2, COLORS.gridHover, 0.8);
+              hintGraphics.moveTo(gridSize / 2 - 6, gridSize / 2);
+              hintGraphics.lineTo(gridSize / 2 + 6, gridSize / 2);
+              hintGraphics.moveTo(gridSize / 2, gridSize / 2 - 6);
+              hintGraphics.lineTo(gridSize / 2, gridSize / 2 + 6);
+            } else if (buildMode === 'build') {
+              bg.beginFill(COLORS.grid, 0.2);
+              bg.lineStyle(1, color, 0.15);
+              bg.drawRect(1, 1, gridSize - 2, gridSize - 2);
+              bg.endFill();
+              hintGraphics.visible = false;
+            } else if (buildMode === 'upgrade') {
+              bg.beginFill(COLORS.grid, 0.25);
+              bg.lineStyle(1, 0x22c55e, 0.3);
+              bg.drawRect(1, 1, gridSize - 2, gridSize - 2);
+              bg.endFill();
+              hintGraphics.visible = false;
+            } else if (buildMode === 'demolish') {
+              bg.beginFill(COLORS.grid, 0.25);
+              bg.lineStyle(1, 0xef4444, 0.3);
+              bg.drawRect(1, 1, gridSize - 2, gridSize - 2);
+              bg.endFill();
+              hintGraphics.visible = false;
+            }
+          } else {
+            // 敌方空格：保持淡色填充
+            bg.beginFill(COLORS.grid, 0.3);
+            bg.lineStyle(1, color, 0.3);
+            bg.drawRect(1, 1, gridSize - 2, gridSize - 2);
+            bg.endFill();
+            hintGraphics.visible = false;
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * 绘制单个格子形状（辅助方法）
+   */
+  private drawGridCellShape(g: PIXI.Graphics, color: number) {
+    const { gridSize } = GAME_CONFIG;
+    g.beginFill(COLORS.grid, 0.3);
+    g.lineStyle(1, color, 0.3);
+    g.drawRect(1, 1, gridSize - 2, gridSize - 2);
+    g.endFill();
+  }
+
+  /**
+   * 格子 hover 开始：0.5s 延迟后显示 tooltip
+   */
+  private handleGridHover(key: string) {
+    if (this.hoveredGridKey && this.hoveredGridKey !== key) {
+      this.handleGridHoverEnd(this.hoveredGridKey);
+    }
+
+    this.hoveredGridKey = key;
+    if (this.hoveredGridTimer !== null) {
+      window.clearTimeout(this.hoveredGridTimer);
+      this.hoveredGridTimer = null;
+    }
+    this.hoveredGridTimer = window.setTimeout(() => {
+      const cell = this.gridSprites.get(key);
+      if (!cell || this.hoveredGridKey !== key) return;
+      this.showGridTooltip(key, cell);
+    }, 500);
+  }
+
+  /**
+   * 格子 hover 结束：取消延迟，隐藏 tooltip
+   */
+  private handleGridHoverEnd(key: string) {
+    if (this.hoveredGridKey === key) {
+      this.hoveredGridKey = null;
+    }
+    if (this.hoveredGridTimer !== null) {
+      window.clearTimeout(this.hoveredGridTimer);
+      this.hoveredGridTimer = null;
+    }
+    // 当前显示的就是该格子的 tooltip 时才隐藏（避免误隐藏其他格子的提示）
+    if (this.tooltipContainer && (this.tooltipContainer as any).sourceKey === key) {
+      this.tooltipContainer.visible = false;
+      (this.tooltipContainer as any).sourceKey = null;
+    }
+  }
+
+  /**
+   * 显示格子 tooltip：空格显示建造信息，已建格子显示孵化室信息
+   */
+  private showGridTooltip(key: string, cell: PIXI.Container) {
+    if (!this.tooltipContainer || !this.tooltipText || !this.tooltipBg) return;
+
+    const state = useGameStore.getState();
+    const [side, colStr, rowStr] = key.split('-');
+    const col = parseInt(colStr, 10);
+    const row = parseInt(rowStr, 10);
+
+    const hatchery = state.hatcheries.find(
+      h => h.side === side && h.gridPos.col === col && h.gridPos.row === row,
+    );
+
+    let text: string;
+    if (hatchery) {
+      const headName = getHeadConfig(hatchery.template.head).nameCN;
+      const thoraxName = getThoraxConfig(hatchery.template.thorax).nameCN;
+      const abdomenName = getAbdomenConfig(hatchery.template.abdomen).nameCN;
+      const sideLabel = hatchery.side === 'player' ? '我方' : '敌方';
+      const refund = Math.floor(hatchery.totalInvested * state.config.demolishRefundRate);
+      const isMaxLevel = hatchery.level >= state.config.maxHatcheryLevel;
+      const upgradeLine = isMaxLevel
+        ? '升级: 已满级'
+        : `升级费用: 🍯${hatchery.cost}`;
+      text =
+        `${sideLabel}孵化室 Lv.${hatchery.level}\n` +
+        `头: ${headName}\n胸: ${thoraxName}\n腹: ${abdomenName}\n` +
+        `已投资: 🍯${hatchery.totalInvested}\n` +
+        `${upgradeLine}\n` +
+        `拆除返还: 🍯${refund}`;
+    } else {
+      const cost = calculateHatcheryCost(state.playerTemplate);
+      const canAfford = state.playerFood >= cost;
+      text =
+        `空格 (${col},${row})\n` +
+        `建造成本: 🍯${cost}\n` +
+        (canAfford ? '点击可建造' : '食物不足');
+    }
+
+    this.tooltipText.text = text;
+
+    const padding = 8;
+    const bgWidth = this.tooltipText.width + padding * 2;
+    const bgHeight = this.tooltipText.height + padding * 2;
+
+    this.tooltipBg.clear();
+    this.tooltipBg.beginFill(0x1a1a2e, 0.92);
+    this.tooltipBg.lineStyle(1, 0x888888, 0.6);
+    this.tooltipBg.drawRoundedRect(0, 0, bgWidth, bgHeight, 6);
+    this.tooltipBg.endFill();
+
+    this.tooltipText.position.set(padding, padding);
+
+    // 定位到格子下方，避免遮挡格子
+    const { gridSize } = GAME_CONFIG;
+    let x = cell.position.x + gridSize / 2 - bgWidth / 2;
+    let y = cell.position.y + gridSize + 5;
+
+    // 超出底部则放到格子上方
+    if (y + bgHeight > GAME_CONFIG.mapHeight - 5) {
+      y = cell.position.y - bgHeight - 5;
+    }
+    x = Math.max(5, Math.min(GAME_CONFIG.mapWidth - bgWidth - 5, x));
+
+    this.tooltipContainer.position.set(x, y);
+    this.tooltipContainer.visible = true;
+    (this.tooltipContainer as any).sourceKey = key;
+  }
+
+  /**
+   * 格子点击处理：根据 buildMode 触发建造/升级/拆除
+   */
+  private handleGridClick(side: Side, gridPos: GridPosition) {
+    const state = useGameStore.getState();
+    if (state.status !== 'playing') return;
+
+    const existing = state.hatcheries.find(
+      h => h.side === side && h.gridPos.col === gridPos.col && h.gridPos.row === gridPos.row,
+    );
+
+    switch (state.buildMode) {
+      case 'build':
+        if (existing) return;
+        state.buildHatchery(side, gridPos, state.playerTemplate);
+        break;
+      case 'upgrade':
+        if (!existing) return;
+        state.upgradeHatchery(existing.id);
+        break;
+      case 'demolish':
+        if (!existing) return;
+        state.demolishHatchery(existing.id);
+        break;
     }
   }
 
@@ -560,17 +846,7 @@ export class PixiRenderer {
     body.drawRoundedRect(-size / 2, -size / 2, size, size, 6);
     body.endFill();
 
-    // 内部圆形（代表孵化中的蚂蚁）- 大小随等级增加
-    const innerRadius = size / 4 + (hatchery.level - 1) * 2;
-    body.beginFill(colors.primary, 0.6 + hatchery.level * 0.1);
-    body.drawCircle(0, 0, innerRadius);
-    body.endFill();
-
-    // 发光边框 - 等级越高越亮
-    body.lineStyle(1, colors.glow, 0.3 + hatchery.level * 0.2);
-    body.drawRoundedRect(-size / 2 + 3, -size / 2 + 3, size - 6, size - 6, 4);
-
-    // 等级标识（星星）
+    // 等级标识（星星）- 在蚂蚁图标之前绘制，确保星星显示在左上角不被遮挡
     if (hatchery.level > 1) {
       body.lineStyle(0);
       body.beginFill(0xffd700);
@@ -583,6 +859,25 @@ export class PixiRenderer {
     }
 
     container.addChild(body);
+
+    // 蚂蚁预览（按真实 head/thorax/abdomen 绘制，缩放 0.8 留出边距显示星星）
+    const antIcon = new PIXI.Graphics();
+    antIcon.name = 'antIcon';
+    this.drawAntIcon(
+      antIcon,
+      hatchery.template,
+      hatchery.side,
+      0.8,
+      0,
+      0,
+    );
+    container.addChild(antIcon);
+
+    // 发光边框 - 等级越高越亮（绘制在蚂蚁之上，营造边缘光晕）
+    const glow = new PIXI.Graphics();
+    glow.lineStyle(1, colors.glow, 0.3 + hatchery.level * 0.2);
+    glow.drawRoundedRect(-size / 2 + 3, -size / 2 + 3, size - 6, size - 6, 4);
+    container.addChild(glow);
 
     // 进度条背景
     const progressBg = new PIXI.Graphics();
@@ -599,16 +894,19 @@ export class PixiRenderer {
     // 保存等级用于检测变化
     (container as any).hatcheryLevel = hatchery.level;
 
-    // 添加鼠标悬浮交互（显示蚂蚁组成提示）
+    // 记录格子 key，用于把孵化室 sprite 上的 hover 事件转发到对应格子
+    // （孵化室 sprite 在 stage 上 zOrder 更高，会"吃掉"原本发给格子 sprite 的
+    // pointerover/pointerout 事件）
+    const gridKey = `${hatchery.side}-${hatchery.gridPos.col}-${hatchery.gridPos.row}`;
+    (container as any).gridKey = gridKey;
+
+    // 点击 + hover 交互。hover 监听转发到格子 hover 处理（统一 tooltip 显示完整信息）
     container.eventMode = 'static';
     container.hitArea = new PIXI.Rectangle(-size / 2, -size / 2, size, size);
     (container as any).hatcheryId = hatchery.id;
-    container.on('pointerover', () => {
-      this.showHatcheryTooltip(hatchery.id, container);
-    });
-    container.on('pointerout', () => {
-      this.hideHatcheryTooltip();
-    });
+    container.on('pointerover', () => this.handleGridHover(gridKey));
+    container.on('pointerout', () => this.handleGridHoverEnd(gridKey));
+    container.on('pointertap', () => this.handleGridClick(hatchery.side, hatchery.gridPos));
 
     return container;
   }
@@ -694,6 +992,12 @@ export class PixiRenderer {
     armorGlow.name = 'armorGlow';
     armorGlow.visible = false;
     container.addChildAt(armorGlow, 0); // 放在最底层
+
+    // 肾上腺素光环效果容器
+    const adrenalineGlow = new PIXI.Graphics();
+    adrenalineGlow.name = 'adrenalineGlow';
+    adrenalineGlow.visible = false;
+    container.addChildAt(adrenalineGlow, 0);
 
     container.name = ant.id;
 
@@ -873,6 +1177,8 @@ export class PixiRenderer {
         graphics.lineTo(-9, 0);
         graphics.moveTo(-4, 3);
         graphics.lineTo(-8, 3);
+        // 重置 lineStyle 状态
+        graphics.lineStyle(0);
         break;
 
       case 'carpenter':
@@ -903,6 +1209,8 @@ export class PixiRenderer {
         graphics.lineTo(-8, -2);
         graphics.moveTo(-10, 0);
         graphics.lineTo(-8, 2);
+        // 重置 lineStyle 状态
+        graphics.lineStyle(0);
         break;
 
       case 'leafcutter':
@@ -919,6 +1227,8 @@ export class PixiRenderer {
         graphics.lineTo(-3, 5);
         graphics.moveTo(3, -5);
         graphics.lineTo(3, 5);
+        // 重置 lineStyle 状态
+        graphics.lineStyle(0);
         break;
     }
   }
@@ -960,6 +1270,8 @@ export class PixiRenderer {
         // 灵活环纹
         graphics.lineStyle(1.5, secondary);
         graphics.drawEllipse(-11, 0, 8, 4);
+        // 重置 lineStyle 状态
+        graphics.lineStyle(0);
         break;
 
       case 'trap':
@@ -975,6 +1287,8 @@ export class PixiRenderer {
         graphics.lineTo(-7, 0);
         graphics.moveTo(-16, 4);
         graphics.lineTo(-8, 4);
+        // 重置 lineStyle 状态（避免红色 secondary 污染后续绘制）
+        graphics.lineStyle(0);
         break;
 
       case 'spitter':
@@ -1008,14 +1322,67 @@ export class PixiRenderer {
         // 环纹
         graphics.lineStyle(1, secondary, 0.5);
         graphics.drawEllipse(-11, 0, 9, 6);
+        // 重置 lineStyle 状态
+        graphics.lineStyle(0);
         break;
     }
   }
 
   /**
+   * 在指定 Graphics 上绘制一个迷你蚂蚁图标（按 head/thorax/abdomen 真实形态）
+   * 用于基地格子、tooltip 等场景的蚂蚁预览。
+   * 复用 drawAbdomen/drawThorax/drawHead，通过 scale 缩放控制大小。
+   *
+   * @param graphics 目标 PIXI.Graphics（已由调用方持有）
+   * @param template 蚂蚁模板（head/thorax/abdomen variant）
+   * @param side 阵营（影响部分色系与 glow）
+   * @param scale 缩放因子（格子内通常 0.7~0.9）
+   * @param centerX 中心 x（graphics 局部坐标）
+   * @param centerY 中心 y（graphics 局部坐标）
+   */
+  private drawAntIcon(
+    graphics: PIXI.Graphics,
+    template: AntTemplate,
+    side: Side,
+    scale: number,
+    centerX: number,
+    centerY: number,
+  ) {
+    const headVariant = template.head as HeadVariant;
+    const thoraxVariant = template.thorax as ThoraxVariant;
+    const abdomenVariant = template.abdomen as AbdomenVariant;
+
+    const headColor = HEAD_COLORS[headVariant];
+    const thoraxColor = THORAX_COLORS[thoraxVariant];
+    const abdomenColor = ABDOMEN_COLORS[abdomenVariant];
+
+    const sideGlow = (side === 'player' ? COLORS.player : COLORS.enemy).glow;
+
+    // 应用坐标变换：先移动到指定中心点，然后整体缩放
+    // Pixi v7 setTransform(a, b, c, d, tx, ty) 即 matrix(a,b,c,d,tx,ty)
+    graphics.setTransform(scale, 0, 0, scale, centerX, centerY);
+
+    // 绘制顺序：腹 → 胸 → 头（与 createAntSprite 保持一致）
+    // 每次调用前显式清除 lineStyle，避免上一段（腹部 / 胸部）的描边
+    // 状态污染到下一段（陷阱蚁腹、织叶蚁腹、马塔贝勒蚁腹、行军蚁胸、
+    // 子弹蚁胸、切叶蚁胸的 lineStyle 会延续）。
+    graphics.lineStyle(0);
+    this.drawAbdomen(graphics, abdomenVariant, abdomenColor, sideGlow);
+
+    graphics.lineStyle(0);
+    this.drawThorax(graphics, thoraxVariant, thoraxColor, sideGlow);
+
+    graphics.lineStyle(0);
+    this.drawHead(graphics, headVariant, headColor, sideGlow);
+
+    // 恢复 graphics 矩阵为单位矩阵，避免影响后续绘制
+    graphics.setTransform(1, 0, 0, 1, 0, 0);
+  }
+
+  /**
    * 创建中毒粒子
    */
-  private createPoisonParticle(antId: string): PoisonParticle {
+  private createPoisonParticle(_antId: string): PoisonParticle {
     const angle = Math.random() * Math.PI * 2;
     const radius = Math.random() * POISON_PARTICLE_CONFIG.spawnRadius;
 
@@ -1060,8 +1427,7 @@ export class PixiRenderer {
 
     const deltaMs = deltaTime * 1000;
 
-    // 生成新粒子
-    const spawnInterval = 100; // 每100ms生成一个粒子
+    // 生成新粒子（使用固定间隔）
     if (particles.length < POISON_PARTICLE_CONFIG.count) {
       particles.push(this.createPoisonParticle(ant.id));
     }
@@ -1113,6 +1479,9 @@ export class PixiRenderer {
 
     // 更新战线动画
     this.drawBattleLine();
+
+    // 同步建造格子外观（buildMode、玩家食物、孵化室列表变化）
+    this.refreshBuildZoneCells();
 
     // 更新蚁后血条
     this.updateQueenHpBar('player', state.playerQueen.hp, state.playerQueen.maxHp);
@@ -1188,6 +1557,9 @@ export class PixiRenderer {
 
       // 更新护甲光环效果
       this.updateArmorGlow(ant, sprite);
+
+      // 更新肾上腺素光环效果
+      this.updateAdrenalineGlow(ant, sprite);
     }
 
     // 处理尾针甩尾动画事件
@@ -1205,11 +1577,16 @@ export class PixiRenderer {
     // 同步子弹精灵
     this.updateProjectiles(state.projectiles);
 
-    // 孵化室提示：如果当前悬停的孵化室已不存在，隐藏提示
-    if (this.hoveredHatcheryId && this.tooltipContainer?.visible) {
-      const hatcheryExists = state.hatcheries.some(h => h.id === this.hoveredHatcheryId);
-      if (!hatcheryExists) {
-        this.hideHatcheryTooltip();
+    // 格子提示：如果 tooltip 显示的是一个已不存在的格子，隐藏它
+    if (this.tooltipContainer?.visible) {
+      const sourceKey = (this.tooltipContainer as any).sourceKey as string | null | undefined;
+      if (sourceKey) {
+        // key 格式为 `${side}-${col}-${row}`
+        const exists = this.gridSprites.has(sourceKey);
+        if (!exists) {
+          this.tooltipContainer.visible = false;
+          (this.tooltipContainer as any).sourceKey = null;
+        }
       }
     }
 
@@ -1422,6 +1799,36 @@ export class PixiRenderer {
       armorGlow.lineStyle(1.5, 0xaaaaaa, pulse);
       armorGlow.drawCircle(0, 0, 17);
     }
+  }
+
+  /**
+   * 更新肾上腺素光环效果
+   */
+  private updateAdrenalineGlow(ant: Ant, sprite: PIXI.Container) {
+    const adrenalineGlow = sprite.getChildByName('adrenalineGlow') as PIXI.Graphics;
+    if (!adrenalineGlow) return;
+
+    // 检查是否有肾上腺素buff（damageUp类型，且该蚂蚁有肾上腺素能力）
+    const hasAdrenalineBuff = ant.buffs.some(buff => buff.type === 'damageUp' && ant.hasAdrenaline);
+
+    if (!hasAdrenalineBuff) {
+      adrenalineGlow.visible = false;
+      return;
+    }
+
+    adrenalineGlow.visible = true;
+    adrenalineGlow.clear();
+
+    const time = performance.now() / 1000;
+    // 红色脉冲光环 - 快速跳动的红色能量效果
+    const pulse = Math.sin(time * 8) * 0.2 + 0.6;
+    adrenalineGlow.lineStyle(2.5, 0xff4444, pulse);
+    adrenalineGlow.drawCircle(0, 0, 20);
+    adrenalineGlow.lineStyle(1.5, 0xff0000, pulse * 0.7);
+    adrenalineGlow.drawCircle(0, 0, 24);
+    // 添加小三角箭头指示方向感
+    adrenalineGlow.lineStyle(1, 0xff6666, pulse * 0.5);
+    adrenalineGlow.drawCircle(0, 0, 28);
   }
 
   /**
@@ -1777,7 +2184,11 @@ export class PixiRenderer {
       this.tooltipBg = null;
       this.tooltipText = null;
     }
-    this.hoveredHatcheryId = null;
+    if (this.hoveredGridTimer !== null) {
+      window.clearTimeout(this.hoveredGridTimer);
+      this.hoveredGridTimer = null;
+    }
+    this.hoveredGridKey = null;
     // PIXI app 的销毁由外部 hook 处理
   }
 }

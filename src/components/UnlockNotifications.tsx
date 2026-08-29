@@ -3,7 +3,7 @@
  * 显示最近解锁的部件浮动通知
  */
 
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useGameStore } from '../store/gameStore';
 import type { UnlockNotification } from '../types';
 
@@ -21,21 +21,29 @@ const PART_TYPE_LABELS: Record<string, string> = {
 export const UnlockNotifications: React.FC = () => {
   const { unlockNotifications, clearUnlockNotifications } = useGameStore();
   const [displayQueue, setDisplayQueue] = useState<DisplayNotification[]>([]);
+  // 追踪已经展示过的通知 id，防止 React 18 StrictMode 双调用或在 unlockPart/clearUnlockNotifications
+  // 之间的微妙时序窗口中把同一条通知重复加入 displayQueue 导致 duplicate key 警告。
+  const displayedIdsRef = useRef<Set<string>>(new Set());
 
   // 处理新通知
   useEffect(() => {
     if (unlockNotifications.length === 0) return;
 
-    // 只展示玩家的解锁通知
-    const playerNotifications = unlockNotifications.filter(n => n.side === 'player');
-    
+    // 只展示玩家的解锁通知，并跳过已经展示过的（避免重复 key）
+    const playerNotifications = unlockNotifications.filter(
+      n => n.side === 'player' && !displayedIdsRef.current.has(n.id),
+    );
+
     if (playerNotifications.length > 0) {
       const newDisplay: DisplayNotification[] = playerNotifications.map(n => ({
         ...n,
         visible: true,
         fadeOut: false,
       }));
-      
+
+      // 先登记再入队，保证即使 effect 在同帧重入也不会重复
+      newDisplay.forEach(n => displayedIdsRef.current.add(n.id));
+
       setDisplayQueue(prev => [...prev, ...newDisplay]);
     }
 
@@ -45,6 +53,7 @@ export const UnlockNotifications: React.FC = () => {
 
   // 自动移除通知
   const removeNotification = useCallback((id: string) => {
+    displayedIdsRef.current.delete(id);
     setDisplayQueue(prev => prev.filter(n => n.id !== id));
   }, []);
 
@@ -82,7 +91,7 @@ export const UnlockNotifications: React.FC = () => {
     <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 flex flex-col gap-2 pointer-events-none">
       {displayQueue.map(notification => (
         <div
-          key={notification.id}
+          key={`${notification.id}-${notification.gameTime}`}
           className={`
             px-6 py-3 rounded-lg border backdrop-blur-sm
             bg-gradient-to-r from-yellow-900/80 to-amber-900/80

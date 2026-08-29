@@ -1,5 +1,5 @@
 /**
- * 蚁巢争霸 - 应用入口
+ * 融合蚁大战 - 应用入口
  */
 
 import React from 'react';

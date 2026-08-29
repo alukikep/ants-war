@@ -1,5 +1,5 @@
 /**
- * 蚁巢争霸 - 核心类型定义
+ * 融合蚁大战 - 核心类型定义
  * 设计为可扩展架构，便于后续接入 LLM API 分析
  */
 
@@ -54,6 +54,7 @@ export interface PartConfig {
     hp: number;          // 生命值加成
     speed: number;       // 移速加成
     attackSpeed: number; // 攻速加成 (攻击间隔减少比例)
+    flatArmor?: number;  // 固定护甲（受到的伤害减去此值，最小为1）
   };
   // 描述，用于 LLM 分析
   description: string;
@@ -136,6 +137,7 @@ export interface Ant {
   hasTauntAbility: boolean;         // 是否拥有嘲讽技能
   tauntCooldown: number;            // 嘲讽技能冷却时间 (ms)
   baseArmor: number;                // 基础护甲（百分比，0.2 = 20%）
+  flatArmor: number;               // 固定护甲（受到的伤害减去此值，最小为1）
 
   // 蜜罐蚁腹死亡爆炸回复
   hasHoneypotExplosion: boolean;    // 是否拥有死亡爆炸回复能力
@@ -145,6 +147,17 @@ export interface Ant {
   isBeingExecuted?: boolean;        // 是否正在被秒杀（用于动画）
   executedBy?: string;              // 被哪只蚂蚁秒杀（执行者ID）
   isExecuting?: boolean;            // 是否正在执行秒杀动画（执行者无敌）
+
+  // 火蚁头部特殊能力：允许同网格多容纳一只
+  allowsStacked?: boolean;         // 是否允许同网格多容纳一只
+
+  // 切叶蚁头部暴击能力
+  critChance: number;              // 暴击率 (0-1之间，如0.15=15%暴击率)
+
+  // 子弹蚁胸肾上腺素技能
+  hasAdrenaline: boolean;          // 是否拥有肾上腺素技能
+  adrenalineCooldown: number;      // 肾上腺素冷却时间 (ms)
+  hasUsedAdrenaline: boolean;      // 是否已使用过肾上腺素（第一次触发后进入冷却）
 }
 
 // 远程子弹/投射物

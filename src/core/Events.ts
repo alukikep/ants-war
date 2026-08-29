@@ -3,7 +3,7 @@
  * 提供游戏内部的事件通信机制
  */
 
-import type { Ant, Hatchery, Projectile, Buff, Side, GridPosition, AntTemplate } from '../types';
+import type { Ant, Hatchery, Projectile, Buff, Side } from '../types';
 
 // ============================================
 // 事件类型定义
@@ -187,7 +187,7 @@ export interface GameEndEvent {
 }
 
 // 联合事件类型
-export type GameEvent = 
+export type GameEvent =
   | AntSpawnEvent
   | AntDeathEvent
   | AntStateChangeEvent
@@ -289,68 +289,68 @@ export const gameEvents = new EventEmitter();
 // 便捷的快捷方法
 export const GameEvents = {
   // 蚂蚁事件
-  emitAntSpawn: (ant: Ant, hatchery: Hatchery) => 
+  emitAntSpawn: (ant: Ant, hatchery: Hatchery) =>
     gameEvents.emit({ type: 'ant_spawn', ant, hatchery }),
-  
-  emitAntDeath: (ant: Ant, killer?: Ant) => 
+
+  emitAntDeath: (ant: Ant, killer?: Ant) =>
     gameEvents.emit({ type: 'ant_death', ant, killer }),
-  
+
   emitAntStateChange: (antId: string, oldState: Ant['state'], newState: Ant['state']) =>
     gameEvents.emit({ type: 'ant_state_change', antId, oldState, newState }),
-  
+
   emitAntDamaged: (antId: string, damage: number, attackerId: string | undefined, newHp: number) =>
     gameEvents.emit({ type: 'ant_damaged', antId, damage, attackerId, newHp }),
 
   // 孵化室事件
   emitHatcheryBuilt: (hatchery: Hatchery, side: Side) =>
     gameEvents.emit({ type: 'hatchery_built', hatchery, side }),
-  
+
   emitHatcheryUpgraded: (hatcheryId: string, oldLevel: number, newLevel: number) =>
     gameEvents.emit({ type: 'hatchery_upgraded', hatcheryId, oldLevel, newLevel }),
-  
+
   emitHatcheryDemolished: (hatcheryId: string, side: Side, refund: number) =>
     gameEvents.emit({ type: 'hatchery_demolished', hatcheryId, side, refund }),
 
   // 战斗事件
   emitCombat: (attackerId: string, targetId: string, damage: number) =>
     gameEvents.emit({ type: 'combat', attackerId, targetId, damage }),
-  
+
   emitProjectileFire: (projectile: Projectile) =>
     gameEvents.emit({ type: 'projectile_fire', projectile }),
-  
+
   emitProjectileHit: (projectile: Projectile, targetId: string, damage: number) =>
     gameEvents.emit({ type: 'projectile_hit', projectile, targetId, damage }),
 
   // Buff 事件
   emitBuffApplied: (antId: string, buff: Buff) =>
     gameEvents.emit({ type: 'buff_applied', antId, buff }),
-  
+
   emitBuffExpired: (antId: string, buffType: Buff['type']) =>
     gameEvents.emit({ type: 'buff_expired', antId, buffType }),
 
   // 技能事件
   emitAbilityTriggered: (antId: string, abilityType: string, targetId?: string) =>
     gameEvents.emit({ type: 'ability_triggered', antId, abilityType, targetId }),
-  
+
   emitStingerStrike: (antId: string, targetId: string) =>
     gameEvents.emit({ type: 'stinger_strike', antId, targetId }),
-  
+
   emitHoneypotExplosion: (position: { x: number; y: number }, side: Side, healedAntIds: string[]) =>
     gameEvents.emit({ type: 'honeypot_explosion', position, side, healedAntIds }),
-  
+
   emitTauntTriggered: (antId: string, affectedAntIds: string[]) =>
     gameEvents.emit({ type: 'taunt_triggered', antId, affectedAntIds }),
-  
+
   emitEscapeAbility: (antId: string, healAmount: number) =>
     gameEvents.emit({ type: 'escape_ability', antId, healAmount }),
 
   // 蚁后事件
   emitQueenDamaged: (side: Side, damage: number, newHp: number) =>
     gameEvents.emit({ type: 'queen_damaged', side, damage, newHp }),
-  
+
   emitQueenDefeated: (side: Side) =>
     gameEvents.emit({ type: 'queen_defeated', side }),
-  
+
   emitQueenAttack: (side: Side, targetId: string, damage: number) =>
     gameEvents.emit({ type: 'queen_attack', side, targetId, damage }),
 

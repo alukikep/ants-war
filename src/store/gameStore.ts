@@ -19,7 +19,7 @@ import type {
   UnlockNotification,
   UnlockablePartDef,
 } from '../types';
-import { GAME_CONFIG, QUEEN_CONFIG, BUILD_ZONE, UNLOCK_CONFIG, DIFFICULTY_CONFIG, type Difficulty } from '../config/gameConfig';
+import { GAME_CONFIG, QUEEN_CONFIG, BUILD_ZONE, UNLOCK_CONFIG, type Difficulty } from '../config/gameConfig';
 import {
   getHeadConfig,
   getThoraxConfig,
@@ -146,6 +146,9 @@ const createInitialState = (): GameState => {
   };
 };
 
+// 建造模式默认值
+const DEFAULT_BUILD_MODE: 'build' | 'upgrade' | 'demolish' = 'build';
+
 // Store 接口
 interface GameStore extends GameState {
   // 游戏速度 (1 = 正常, 2 = 2倍速, 3 = 3倍速)
@@ -208,10 +211,18 @@ interface GameStore extends GameState {
 
   // LLM 数据导出
   exportForAnalysis: () => object;
+
+  // 建造模式（由 BuildPanel 控制，PixiRenderer 读取以决定格子交互行为）
+  buildMode: 'build' | 'upgrade' | 'demolish';
+  setBuildMode: (mode: 'build' | 'upgrade' | 'demolish') => void;
 }
 
 export const useGameStore = create<GameStore>((set, get) => ({
   ...createInitialState(),
+
+  // 建造模式默认值
+  buildMode: DEFAULT_BUILD_MODE,
+  setBuildMode: (mode) => set({ buildMode: mode }),
 
   // 游戏速度
   gameSpeed: 1,
@@ -275,6 +286,12 @@ export const useGameStore = create<GameStore>((set, get) => ({
     const hasInstantKill = template.head === 'bigHead';
     // 检查是否拥有蜜罐蚁腹的死亡爆炸回复能力
     const hasHoneypotExplosion = template.abdomen === 'honeypot';
+    // 检查是否拥有火蚁头的特殊能力（允许同网格多容纳一只）
+    const allowsStacked = template.head === 'fire';
+    // 切叶蚁头部的暴击率（根据孵化室等级：1级5%，2级10%，3级15%）
+    const critChance = template.head === 'leafcutter' ? hatchery.level * 0.05 : 0;
+    // 子弹蚁胸的肾上腺素技能（首次受敌时触发）
+    const hasAdrenaline = template.thorax === 'bullet';
 
     const ant: Ant = {
       id: uuidv4(),
@@ -325,7 +342,8 @@ export const useGameStore = create<GameStore>((set, get) => ({
       // 切叶蚁胸嘲讽技能
       hasTauntAbility,
       tauntCooldown: 0,
-      baseArmor: hasTauntAbility ? 0.2 : 0, // 20%基础护甲
+      baseArmor: 0, // 切叶蚁胸不再有基础护甲，护甲效果通过技能触发
+      flatArmor: baseStats.flatArmor || 0, // 木蚁胸固定护甲
       // 蜜罐蚁腹死亡爆炸回复
       hasHoneypotExplosion,
       // 大头蚁头部秒杀能力
@@ -333,6 +351,14 @@ export const useGameStore = create<GameStore>((set, get) => ({
       isBeingExecuted: false,
       executedBy: undefined,
       isExecuting: false,
+      // 火蚁头部特殊能力
+      allowsStacked,
+      // 切叶蚁头部暴击能力
+      critChance,
+      // 子弹蚁胸肾上腺素技能
+      hasAdrenaline,
+      adrenalineCooldown: 0,
+      hasUsedAdrenaline: false,
     };
 
     set((state) => ({

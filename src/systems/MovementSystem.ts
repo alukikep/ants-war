@@ -26,7 +26,7 @@ function lerpAngle(current: number, target: number, t: number): number {
 }
 
 export class MovementSystem {
-  constructor() {}
+  constructor() { }
 
   /**
    * 更新移动系统
@@ -39,19 +39,19 @@ export class MovementSystem {
   /**
    * 重置系统
    */
-  reset(): void {}
+  reset(): void { }
 
   /**
    * 销毁系统
    */
-  destroy(): void {}
+  destroy(): void { }
 
   /**
    * 更新蚂蚁移动
    */
   private updateAnts(deltaTime: number): void {
     const state = useGameStore.getState();
-    const { collisionDistance } = state.config;
+    const _collisionDistance = state.config.collisionDistance;
     const updates: { id: string; changes: Partial<Ant> }[] = [];
 
     for (const ant of state.ants) {
@@ -60,7 +60,7 @@ export class MovementSystem {
       // 战斗中的蚂蚁（近战）
       if (ant.state === 'fighting') {
         const target = ant.targetId ? state.ants.find(a => a.id === ant.targetId) : null;
-        
+
         if (!target || target.state === 'dead') {
           updates.push({
             id: ant.id,
@@ -82,7 +82,7 @@ export class MovementSystem {
       // 远程射击中的蚂蚁
       if (ant.state === 'shooting') {
         const target = ant.targetId ? state.ants.find(a => a.id === ant.targetId) : null;
-        
+
         if (!target || target.state === 'dead') {
           updates.push({
             id: ant.id,
@@ -95,7 +95,7 @@ export class MovementSystem {
           ant.position.x, ant.position.y,
           target.position.x, target.position.y
         );
-        
+
         if (distToTarget > ant.attackRange) {
           updates.push({
             id: ant.id,
@@ -117,7 +117,7 @@ export class MovementSystem {
       // 追击状态：向目标移动
       if (ant.state === 'chasing') {
         const target = ant.targetId ? state.ants.find(a => a.id === ant.targetId) : null;
-        
+
         if (!target || target.state === 'dead') {
           updates.push({
             id: ant.id,
@@ -129,23 +129,23 @@ export class MovementSystem {
         const dx = target.position.x - ant.position.x;
         const dy = target.position.y - ant.position.y;
         const distance = Math.sqrt(dx * dx + dy * dy);
-        
+
         if (distance > 0) {
           const dirX = dx / distance;
           const dirY = dy / distance;
-          
+
           const targetAngle = getAngle(
             ant.position.x, ant.position.y,
             target.position.x, target.position.y
           );
-          
+
           const effectiveSpeed = this.getEffectiveSpeed(ant);
           const moveDistance = effectiveSpeed * deltaTime;
           const newX = ant.position.x + dirX * moveDistance;
           const newY = ant.position.y + dirY * moveDistance;
-          
+
           const clampedY = Math.max(150, Math.min(450, newY));
-          
+
           updates.push({
             id: ant.id,
             changes: {
@@ -161,11 +161,11 @@ export class MovementSystem {
       const effectiveSpeed = this.getEffectiveSpeed(ant);
       const baseDirection = ant.side === 'player' ? 1 : -1;
       const targetAngle = ant.side === 'player' ? 0 : Math.PI;
-      
+
       const centerY = 300;
       const yDiff = centerY - ant.position.y;
       const yMove = Math.sign(yDiff) * Math.min(Math.abs(yDiff) * 0.5, effectiveSpeed * 0.3) * deltaTime;
-      
+
       const newX = ant.position.x + baseDirection * effectiveSpeed * deltaTime;
       const newY = ant.position.y + yMove;
 
@@ -211,7 +211,7 @@ export class MovementSystem {
     const { antCollisionRadius } = state.config;
     const minDist = antCollisionRadius * 2;
     const minDistSq = minDist * minDist;
-    
+
     const aliveAnts = state.ants.filter(a => a.state !== 'dead' && !a.isBeingExecuted);
     if (aliveAnts.length < 2) return;
 
@@ -236,7 +236,7 @@ export class MovementSystem {
         const distSq = dx * dx + dy * dy;
 
         if (distSq >= minDistSq) continue;
-        
+
         const dist = Math.sqrt(distSq);
         const overlap = minDist - dist;
 
@@ -263,7 +263,7 @@ export class MovementSystem {
 
     if (positionAdjustments.size > 0) {
       const updates: { id: string; changes: Partial<Ant> }[] = [];
-      
+
       for (const ant of aliveAnts) {
         const adj = positionAdjustments.get(ant.id);
         if (!adj || (adj.dx === 0 && adj.dy === 0)) continue;

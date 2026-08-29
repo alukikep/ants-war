@@ -55,7 +55,7 @@ export const StatusBar: React.FC = () => {
                   <span>{playerQueen.hp} / {playerQueen.maxHp}</span>
                 </div>
                 <div className="h-4 bg-gray-800 rounded-full overflow-hidden border border-player-blue/30">
-                  <div 
+                  <div
                     className="h-full bg-gradient-to-r from-player-blue to-blue-400 transition-all duration-300"
                     style={{ width: `${playerHpPercent}%` }}
                   />
@@ -83,7 +83,7 @@ export const StatusBar: React.FC = () => {
               {status === 'defeat' && '失败'}
             </div>
             <div className="text-xs text-gray-500 mt-1">
-              蚁巢争霸
+              融合蚁大战
             </div>
           </div>
 
@@ -105,7 +105,7 @@ export const StatusBar: React.FC = () => {
                   <span>{enemyQueen.hp} / {enemyQueen.maxHp}</span>
                 </div>
                 <div className="h-4 bg-gray-800 rounded-full overflow-hidden border border-enemy-red/30">
-                  <div 
+                  <div
                     className="h-full bg-gradient-to-r from-red-400 to-enemy-red transition-all duration-300"
                     style={{ width: `${enemyHpPercent}%` }}
                   />

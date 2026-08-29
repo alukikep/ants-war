@@ -29,13 +29,13 @@ export const HEAD_CONFIGS: Record<HeadVariant, PartConfig> = {
     type: 'head',
     variant: 'leafcutter',
     stats: {
-      damage: 15,
+      damage: 20,
       hp: 0,
       speed: 0,
       attackSpeed: 0,
     },
-    description: '锋利的大颚，增加攻击力',
-    cost: 40,
+    description: '锋利的大颚，增加攻击力和暴击率（1级5%，2级10%，3级15%，暴击3倍伤害）',
+    cost: 80,
   },
   soldier: {
     id: 'head_soldier',
@@ -59,12 +59,12 @@ export const HEAD_CONFIGS: Record<HeadVariant, PartConfig> = {
     type: 'head',
     variant: 'fire',
     stats: {
-      damage: 10,
+      damage: 0,
       hp: 0,
       speed: 0,
-      attackSpeed: 20,
+      attackSpeed: 10,
     },
-    description: '毒牙攻击，提升攻击速度',
+    description: '毒牙攻击，攻速+10%，同网格可容纳两只',
     cost: 60,
   },
   odontomachus: {
@@ -153,12 +153,13 @@ export const THORAX_CONFIGS: Record<ThoraxVariant, PartConfig> = {
     type: 'thorax',
     variant: 'carpenter',
     stats: {
-      damage: 5,
+      damage: 0,
       hp: 15,
       speed: 10,
       attackSpeed: 0,
+      flatArmor: 10,
     },
-    description: '强健的胸部，均衡提升各项属性',
+    description: '强健的胸部，+10固定护甲（减免伤害，受到11伤害只受1伤害）',
     cost: 60,
   },
   bullet: {
@@ -168,12 +169,12 @@ export const THORAX_CONFIGS: Record<ThoraxVariant, PartConfig> = {
     type: 'thorax',
     variant: 'bullet',
     stats: {
-      damage: 10,
-      hp: -10,
+      damage: 0,
+      hp: -30,
       speed: 50,
       attackSpeed: 10,
     },
-    description: '极速突击型，牺牲防御换取速度',
+    description: '极速突击型，肾上腺素技能：首次受敌时+50%攻击力(2级75%，3级100%)和护甲(2级60%，3级80%)，持续5/8/12秒，冷却60秒',
     cost: 80,
   },
   leafcutter: {
@@ -188,7 +189,7 @@ export const THORAX_CONFIGS: Record<ThoraxVariant, PartConfig> = {
       speed: 0,
       attackSpeed: 0,
     },
-    description: '坚甲坦克，20%护甲减伤，嘲讽技能迫使敌人攻击自身并回复+护甲（15秒冷却）',
+    description: '坚甲坦克，生命低于20%时触发嘲讽，迫使敌人攻击自身，回复30%血量并获得80%护甲5秒（15秒冷却）',
     cost: 90,
   },
 };
@@ -262,15 +263,13 @@ export const ABDOMEN_CONFIGS: Record<AbdomenVariant, PartConfig> = {
     type: 'abdomen',
     variant: 'spitter',
     stats: {
-      damage: 8,         // 基础远程伤害
-      hp: -30,           // -30% 最大生命值（通过 hpMultiplier 实现）
+      damage: 25,         // 基础远程伤害25
+      hp: -80,           // -80% 最大生命值
       speed: 5,
-      attackSpeed: 0,
+      attackSpeed: 0,     // 无攻击速度加成
     },
-    description: '喷酸腺体，远程攻击（-30%生命值，头部攻击力30%作用于远程）',
+    description: '喷酸腺体，远程攻击+25，享受完整头部攻击力加成（-80%生命值）',
     cost: 80,
-    // 特殊标记：远程攻击
-    // isRanged: true 在 calculateAntStats 中特殊处理
   },
   matabele: {
     id: 'abdomen_matabele',
@@ -306,8 +305,8 @@ export function getAbdomenConfig(variant: AbdomenVariant): PartConfig {
 export const RANGED_CONFIG = {
   attackRange: 150,           // 远程攻击射程
   projectileSpeed: 250,       // 子弹飞行速度
-  headDamageBonus: 0.3,       // 头部攻击力对远程伤害的加成比例 (30%)
-  hpPenalty: 0.3,             // 生命值惩罚 (30%)
+  headDamageBonus: 1.0,       // 头部攻击力对远程伤害的加成比例 (100%)
+  hpPenalty: 0.8,             // 生命值惩罚 (80%)
 };
 
 // 大齿猛蚁头部特殊能力配置
@@ -383,11 +382,11 @@ export const INSTANT_KILL_CONFIG = {
 // 切叶蚁胸嘲讽技能配置
 export const TAUNT_ABILITY_CONFIG = {
   cooldown: 15000,                    // 冷却时间 15秒
-  baseArmor: 0.2,                     // 基础护甲 20%（永久）
   tauntRadius: 100,                   // 嘲讽范围 100px
-  healPercent: 0.4,                   // 恢复 40% 最大生命值
+  healPercent: 0.3,                   // 恢复 30% 最大生命值
   armorBuffValue: 0.8,                // 嘲讽后护甲提升到 80%
   armorBuffDuration: 5000,            // 护甲buff持续 5秒
+  triggerThreshold: 0.2,              // 生命值低于 20% 时触发
 };
 
 // 计算战略价值（考虑特殊机制）
@@ -494,10 +493,10 @@ export function calculateAntStats(
     baseHp += abdomen.stats.hp;
   }
 
-  // 计算远程伤害：腹部基础伤害 + 头部攻击力 * 30%
+  // 计算远程伤害：享受完整的头部攻击力加成（不再是30%）
   const headDamageBonus = head.stats.damage;
   const rangedDamage = isRanged
-    ? Math.max(1, abdomen.stats.damage + Math.floor(headDamageBonus * RANGED_CONFIG.headDamageBonus))
+    ? Math.max(1, abdomen.stats.damage + headDamageBonus + thorax.stats.damage) // 完整头部+胸部伤害
     : 0;
 
   return {
@@ -513,6 +512,8 @@ export function calculateAntStats(
     attackRange: isRanged ? RANGED_CONFIG.attackRange : 25, // 远程150px，近战25px
     // 战略价值：考虑特殊机制的加成
     strategicValue: calculateStrategicValue(headVariant, thoraxVariant, abdomenVariant, baseHp, baseDamage, isRanged),
+    // 固定护甲（木蚁胸）
+    flatArmor: thorax.stats.flatArmor || 0,
   };
 }
 

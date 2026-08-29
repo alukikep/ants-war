@@ -6,6 +6,7 @@
 import { useGameStore } from '../store/gameStore';
 import { GameEvents } from '../core/Events';
 import type { Ant } from '../types';
+import { playSound } from '../components/SoundControl';
 
 // 工具函数
 function getDistance(x1: number, y1: number, x2: number, y2: number): number {
@@ -26,9 +27,9 @@ function lerpAngle(current: number, target: number, t: number): number {
 }
 
 export class CombatSystem {
-  private lastTargetingTime = 0;
+  private _lastTargetingTime = 0;
 
-  constructor() {}
+  constructor() { }
 
   /**
    * 更新战斗系统
@@ -42,7 +43,7 @@ export class CombatSystem {
    * 重置系统
    */
   reset(): void {
-    this.lastTargetingTime = 0;
+    this._lastTargetingTime = 0;
   }
 
   /**
@@ -65,7 +66,7 @@ export class CombatSystem {
       if (ant.state === 'dead' || ant.state === 'fighting' || ant.state === 'shooting' || ant.isBeingExecuted) continue;
 
       // 获取敌方蚂蚁（排除被秒杀中的）
-      const enemies = state.ants.filter(a => 
+      const enemies = state.ants.filter(a =>
         a.side !== ant.side && a.state !== 'dead' && !a.isBeingExecuted
       );
 
@@ -104,7 +105,8 @@ export class CombatSystem {
       if (nearestDistance <= effectiveAttackRange) {
         if (ant.isRanged) {
           // 远程蚂蚁进入射击状态
-          if (ant.state !== 'shooting') {
+          const currentState = ant.state as string;
+          if (currentState !== 'shooting') {
             updates.push({
               id: ant.id,
               changes: { state: 'shooting', targetId: nearestEnemy.id },
@@ -112,7 +114,8 @@ export class CombatSystem {
           }
         } else {
           // 近战蚂蚁进入战斗状态
-          if (ant.state !== 'fighting') {
+          const currentState = ant.state as string;
+          if (currentState !== 'fighting') {
             updates.push({
               id: ant.id,
               changes: { state: 'fighting', targetId: nearestEnemy.id },
@@ -156,7 +159,7 @@ export class CombatSystem {
 
     for (const ant of fightingAnts) {
       const target = ant.targetId ? state.ants.find(a => a.id === ant.targetId) : null;
-      
+
       if (!target || target.state === 'dead') {
         updates.push({
           id: ant.id,
@@ -164,30 +167,74 @@ export class CombatSystem {
         });
         continue;
       }
-      
+
       if (target.isBeingExecuted || target.isExecuting) continue;
 
       // 检查攻击冷却
       if (ant.attackCooldown <= 0) {
-        // 计算护甲减伤后的实际伤害
+        // 计算护甲减伤后的实际伤害（先百分比减伤，再固定值减伤）
         const armorMultiplier = this.getArmorMultiplier(target);
-        const actualDamage = Math.max(1, Math.floor(ant.damage * armorMultiplier));
+        let baseDamage = Math.floor(ant.damage * armorMultiplier);
+        // 暴击判定（切叶蚁头部）
+        if (ant.critChance > 0 && Math.random() < ant.critChance) {
+          baseDamage *= 3;
+        }
+        const actualDamage = Math.max(1, baseDamage - target.flatArmor);
         const newTargetHp = target.hp - actualDamage;
-        
+
         updates.push({
           id: target.id,
           changes: { hp: newTargetHp },
         });
-        
+
+        // 触发肾上腺素技能检查（子弹蚁胸）
+        if (target.hasAdrenaline && !target.hasUsedAdrenaline) {
+          // 根据孵化室等级计算肾上腺素效果和持续时间
+          const level = target.sourceLevel || 1;
+          const adrenalineBonus = level === 1 ? { damage: 0.5, armor: 0.5, duration: 5000 } : level === 2 ? { damage: 0.75, armor: 0.6, duration: 8000 } : { damage: 1.0, armor: 0.8, duration: 12000 };
+          updates.push({
+            id: target.id,
+            changes: {
+              hasUsedAdrenaline: true,
+              adrenalineCooldown: 60000, // 60秒冷却
+              // 添加攻击力buff和护甲buff
+              buffs: [
+                ...target.buffs,
+                {
+                  id: `adrenaline_damage_${Date.now()}`,
+                  type: 'damageUp' as const,
+                  value: adrenalineBonus.damage,
+                  duration: adrenalineBonus.duration,
+                  maxDuration: adrenalineBonus.duration,
+                  stackable: false,
+                },
+                {
+                  id: `adrenaline_armor_${Date.now()}`,
+                  type: 'armor' as const,
+                  value: adrenalineBonus.armor,
+                  duration: adrenalineBonus.duration,
+                  maxDuration: adrenalineBonus.duration,
+                  stackable: false,
+                },
+              ],
+            },
+          });
+        }
+
         // 更新攻击冷却
         const effectiveAttackSpeed = this.getEffectiveAttackSpeed(ant);
         updates.push({
           id: ant.id,
-          changes: { 
+          changes: {
             attackCooldown: effectiveAttackSpeed,
             rotation: lerpAngle(ant.rotation, getAngle(ant.position.x, ant.position.y, target.position.x, target.position.y), deltaTime * 10),
           },
         });
+
+        // 播放攻击音效（近战）
+        if (!ant.isRanged) {
+          playSound.attack(false);
+        }
 
         // 目标死亡
         if (newTargetHp <= 0) {
@@ -199,7 +246,7 @@ export class CombatSystem {
             id: ant.id,
             changes: { state: 'moving', targetId: null },
           });
-          
+
           GameEvents.emitCombat(ant.id, target.id, actualDamage);
         }
       }
@@ -230,7 +277,7 @@ export class CombatSystem {
   private getEffectiveAttackSpeed(ant: Ant): number {
     let speedMultiplier = 1 + ant.attackSpeedBonus;
     let buffMultiplier = 1;
-    
+
     for (const buff of ant.buffs) {
       switch (buff.type) {
         case 'attackSpeedUp':
@@ -241,10 +288,10 @@ export class CombatSystem {
           break;
       }
     }
-    
+
     let totalMultiplier = speedMultiplier * buffMultiplier;
     totalMultiplier = Math.max(0.2, Math.min(3.0, totalMultiplier));
-    
+
     return Math.max(100, ant.attackSpeed / totalMultiplier);
   }
 }
