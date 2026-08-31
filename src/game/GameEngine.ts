@@ -1204,9 +1204,6 @@ export class GameEngine {
     // 处理特殊能力（大齿猛蚁弹射逃脱）
     this.handleEscapeAbility(deltaTime);
 
-    // 蚁后远程攻击
-    this.handleQueenAttack(deltaTime);
-
     // 更新子弹
     this.updateProjectiles(deltaTime);
 
@@ -2945,89 +2942,6 @@ export class GameEngine {
       const updates = Array.from(updatesMap.entries()).map(([id, changes]) => ({ id, changes }));
       state.updateAnts(updates);
     }
-  }
-
-  /**
-   * 蚁后远程攻击 - 每0.5秒向最近的敌方蚂蚁发射一个伤害为50的子弹
-   * 用于初期缓冲，防止被对手直接碾压
-   */
-  private handleQueenAttack(deltaTime: number) {
-    const state = useGameStore.getState();
-    const deltaMs = deltaTime * 1000;
-
-    // 更新双方蚁后攻击冷却
-    this.playerQueenAttackCooldown = Math.max(0, this.playerQueenAttackCooldown - deltaMs);
-    this.enemyQueenAttackCooldown = Math.max(0, this.enemyQueenAttackCooldown - deltaMs);
-
-    // 存活蚂蚁列表
-    const aliveAnts = state.ants.filter(a => a.state !== 'dead' && !a.isBeingExecuted);
-
-    // 玩家蚁后攻击
-    if (this.playerQueenAttackCooldown <= 0 && state.playerQueen.hp > 0) {
-      const target = this.findQueenTarget('player', aliveAnts);
-      if (target) {
-        this.fireQueenProjectile('player', QUEEN_CONFIG.playerPosition, target);
-        this.playerQueenAttackCooldown = QUEEN_ATTACK_CONFIG.attackInterval;
-      }
-    }
-
-    // 敌方蚁后攻击
-    if (this.enemyQueenAttackCooldown <= 0 && state.enemyQueen.hp > 0) {
-      const target = this.findQueenTarget('enemy', aliveAnts);
-      if (target) {
-        this.fireQueenProjectile('enemy', QUEEN_CONFIG.enemyPosition, target);
-        this.enemyQueenAttackCooldown = QUEEN_ATTACK_CONFIG.attackInterval;
-      }
-    }
-  }
-
-  /**
-   * 为蚁后寻找攻击范围内最近的敌方蚂蚁
-   */
-  private findQueenTarget(side: Side, aliveAnts: Ant[]): Ant | null {
-    const queenPos = side === 'player' ? QUEEN_CONFIG.playerPosition : QUEEN_CONFIG.enemyPosition;
-    const { range } = QUEEN_ATTACK_CONFIG;
-
-    let nearest: Ant | null = null;
-    let nearestDist = Infinity;
-
-    for (const ant of aliveAnts) {
-      if (ant.side === side) continue; // 跳过友方蚂蚁
-
-      const dist = getDistance(queenPos.x, queenPos.y, ant.position.x, ant.position.y);
-      if (dist <= range && dist < nearestDist) {
-        nearestDist = dist;
-        nearest = ant;
-      }
-    }
-
-    return nearest;
-  }
-
-  /**
-   * 蚁后发射子弹
-   */
-  private fireQueenProjectile(side: Side, queenPos: { x: number; y: number }, target: Ant) {
-    const state = useGameStore.getState();
-
-    const angle = getAngle(queenPos.x, queenPos.y, target.position.x, target.position.y);
-
-    const projectile: Projectile = {
-      id: uuidv4(),
-      side,
-      ownerId: `queen-${side}`,
-      targetId: target.id,
-      damage: QUEEN_ATTACK_CONFIG.damage,
-      speed: QUEEN_ATTACK_CONFIG.projectileSpeed,
-      position: {
-        x: queenPos.x + Math.cos(angle) * 40, // 从蚁后边缘发射
-        y: queenPos.y + Math.sin(angle) * 40,
-      },
-      rotation: angle,
-      isQueenProjectile: true,
-    };
-
-    state.addProjectile(projectile);
   }
 
   /**
