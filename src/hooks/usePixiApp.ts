@@ -12,6 +12,7 @@ import { useEffect, useRef, useCallback } from 'react';
 import * as PIXI from 'pixi.js';
 import { PixiRenderer } from '../game/PixiRenderer';
 import { getGameEngine } from '../game/GameEngine';
+import { OfflineScientist } from '../ai/OfflineScientist';
 import { useGameStore } from '../store/gameStore';
 import { llmKeyStore, getActiveKey } from '../store/llmKeyStore';
 import { GAME_CONFIG } from '../config/gameConfig';
@@ -125,14 +126,20 @@ export function usePixiApp(options: UsePixiAppOptions = {}) {
  * 模块级导出，SettingsPanel 等组件可直接 import 调用。
  */
 export async function reloadAdvisor(): Promise<void> {
-  // 先卸下旧 advisor，避免新旧并存导致重复调用
+  // 先卸下旧 advisor 和旧 offline experimenter，避免新旧并存
   try {
     getGameEngine().setStrategicAdvisor(null);
   } catch { /* ignore */ }
 
   const apiKey = getActiveKey();
   if (!apiKey) {
-    console.log('[DeepSeekAdvisor] 未配置 API key，LLM 战略顾问已关闭（使用纯本地启发式）');
+    console.log('[DeepSeekAdvisor] 未配置 API key，LLM 战略顾问已关闭。已启用本地启发式实验器（仅产出 experiment，科学家沉默）。');
+    // 没配 key → 注入 OfflineScientist
+    try {
+      getGameEngine().setOfflineExperimenter(new OfflineScientist());
+    } catch (err) {
+      console.warn('[OfflineScientist] 注入失败:', err);
+    }
     return;
   }
 
@@ -145,6 +152,10 @@ export async function reloadAdvisor(): Promise<void> {
     const { DeepSeekStrategicAdvisor } = await import('../ai/DeepSeekStrategicAdvisor');
     const advisor = new DeepSeekStrategicAdvisor({ apiKey, baseUrl, model, timeoutMs });
     getGameEngine().setStrategicAdvisor(advisor);
+    // 有 key → 卸下 OfflineScientist（LLM 接管）
+    try {
+      getGameEngine().setOfflineExperimenter(null);
+    } catch { /* ignore */ }
     console.log('[DeepSeekAdvisor] 已启用 -', {
       source: 'runtime',
       baseUrl: baseUrl || 'https://api.deepseek.com',
@@ -162,8 +173,28 @@ export async function reloadAdvisor(): Promise<void> {
         defaultAI.setWeights(directive.weights);
         // 同步告诉引擎：顾问刚被调过，避免引擎在 16ms 后立刻再调一次
         getGameEngine().markAdvisorCalled();
+        const storeApi = useGameStore.getState();
         if (directive.taunt) {
-          try { useGameStore.getState().setAITrashTalk(directive.taunt); } catch { /* ignore */ }
+          try { storeApi.setAITrashTalk(directive.taunt); } catch { /* ignore */ }
+        }
+        if (directive.commentary) {
+          try {
+            storeApi.setScientificCommentary(
+              directive.commentary.text,
+              directive.commentary.highlight,
+            );
+          } catch { /* ignore */ }
+        }
+        if (directive.experiment) {
+          try {
+            storeApi.applyExperiment({
+              kind: directive.experiment.kind,
+              durationMs: directive.experiment.durationMs,
+              magnitude: directive.experiment.magnitude,
+              side: directive.experiment.side,
+              purpose: directive.experiment.purpose,
+            });
+          } catch { /* ignore */ }
         }
         console.log('[DeepSeekAdvisor] 初始战略:', directive.mode);
       }

@@ -8,6 +8,8 @@ import { GameCanvas } from './components/GameCanvas';
 import { AssemblyPanel } from './components/AssemblyPanel';
 import { UnlockNotifications } from './components/UnlockNotifications';
 import { AITrashTalk } from './components/AITrashTalk';
+import { ScientificCommentary } from './components/ScientificCommentary';
+import { ExperimentBanner } from './components/ExperimentBanner';
 import { SoundControl } from './components/SoundControl';
 import { SettingsPanel, APIKeyHint } from './components/SettingsPanel';
 import { soundManager } from './utils/SoundManager';
@@ -64,8 +66,14 @@ const App: React.FC = () => {
       {/* 解锁通知浮层 */}
       <UnlockNotifications />
 
-      {/* AI 垃圾话气泡 */}
+      {/* AI 垃圾话气泡（右下角：敌方蚁后） */}
       <AITrashTalk />
+
+      {/* 科学家观察员评语（左下角：客观实验记录） */}
+      <ScientificCommentary />
+
+      {/* 科学家实验性干预横幅（顶部居中） */}
+      <ExperimentBanner />
 
       {/* 游戏主区域 */}
       <main className="flex-1 flex items-center justify-center p-6">

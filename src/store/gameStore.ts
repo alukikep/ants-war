@@ -18,6 +18,8 @@ import type {
   Projectile,
   UnlockNotification,
   UnlockablePartDef,
+  AcidSpot,
+  ExperimentRecord,
 } from '../types';
 import { GAME_CONFIG, QUEEN_CONFIG, BUILD_ZONE, UNLOCK_CONFIG, type Difficulty } from '../config/gameConfig';
 import {
@@ -143,6 +145,14 @@ const createInitialState = (): GameState => {
     // AI 垃圾话
     aiTrashTalk: '',
     aiTrashTalkTime: 0,
+    // 科学家观察系统
+    scientificCommentary: '',
+    scientificCommentaryTime: 0,
+    // 科学家实验
+    activeExperiment: null,
+    lastExperiment: null,
+    // 酸液场地
+    acidSpots: [],
   };
 };
 
@@ -208,6 +218,19 @@ interface GameStore extends GameState {
 
   // AI 垃圾话
   setAITrashTalk: (message: string) => void;
+
+  // 科学家系统
+  setScientificCommentary: (text: string, highlight?: string) => void;
+  applyExperiment: (exp: {
+    kind: import('../config/experiments').ExperimentKind;
+    durationMs: number;
+    magnitude: number;
+    side: import('../config/experiments').ExperimentSide;
+    purpose: string;
+  }) => void;
+  clearActiveExperiment: () => void;
+  addAcidSpot: (spot: AcidSpot) => void;
+  removeAcidSpot: (id: string) => void;
 
   // LLM 数据导出
   exportForAnalysis: () => object;
@@ -751,6 +774,61 @@ export const useGameStore = create<GameStore>((set, get) => ({
   // AI 垃圾话
   setAITrashTalk: (message: string) => {
     set({ aiTrashTalk: message, aiTrashTalkTime: Date.now() });
+  },
+
+  // 科学家系统
+  setScientificCommentary: (text: string, highlight?: string) => {
+    // highlight 用特殊字符嵌入到 text 末尾供 UI 拆分，避免破坏 text 结构
+    // 简单做法：分开存。保留 text 简洁即可。
+    const payload = highlight ? `${text}\n::HIGHLIGHT::${highlight}` : text;
+    set({ scientificCommentary: payload, scientificCommentaryTime: Date.now() });
+  },
+
+  /**
+   * 注入科学家的"实验性干预"。
+   * - 若新实验与当前 active 同 kind 且 side 重叠，覆盖（刷新时长和强度）
+   * - 否则替换（不叠加，避免混乱）
+   *
+   * endsAt 使用 stats.gameTime 作为基准 —— 这样：
+   * - 暂停时 gameTime 不走，实验自动冻结
+   * - 3x 速下 gameTime 推进 3 倍，实验时长按游戏时间消耗（真实耗时 1/3）
+   */
+  applyExperiment: (exp) => {
+    const state = get();
+    const expRecord: ExperimentRecord = {
+      kind: exp.kind,
+      gameTime: state.stats.gameTime,
+      purpose: exp.purpose,
+      side: exp.side,
+    };
+
+    // 如果是 none，清空 active 但不写 lastExperiment（无操作不记录）
+    if (exp.kind === 'none') {
+      set({ activeExperiment: null });
+      return;
+    }
+
+    const active: import('../types').ActiveExperiment = {
+      kind: exp.kind,
+      side: exp.side,
+      magnitude: exp.magnitude,
+      endsAt: state.stats.gameTime + exp.durationMs,
+      purpose: exp.purpose,
+      source: 'scientist',
+    };
+    set({ activeExperiment: active, lastExperiment: expRecord });
+  },
+
+  clearActiveExperiment: () => {
+    set({ activeExperiment: null });
+  },
+
+  addAcidSpot: (spot) => {
+    set((state) => ({ acidSpots: [...state.acidSpots, spot] }));
+  },
+
+  removeAcidSpot: (id) => {
+    set((state) => ({ acidSpots: state.acidSpots.filter((s) => s.id !== id) }));
   },
 
   // 导出分析数据 (用于 LLM API)

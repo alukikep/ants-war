@@ -21,6 +21,7 @@ export type {
   PartWeights,
   StrategicDirective,
   IStrategicAdvisor,
+  ScientificCommentary,
 } from './GameEngine';
 
 // 战略顾问（从 ./ai 重新导出，便于外部接入）

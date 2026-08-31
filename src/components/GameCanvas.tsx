@@ -3,10 +3,11 @@
  * 包装 PixiJS 渲染
  */
 
-import React from 'react';
+import React, { useState } from 'react';
 import { usePixiApp } from '../hooks/usePixiApp';
 import { useGameStore } from '../store/gameStore';
 import { DIFFICULTY_CONFIG, type Difficulty } from '../config/gameConfig';
+import { TutorialButton, TutorialModal } from './TutorialPanel';
 
 /** 速度切换按钮 */
 const SpeedButton: React.FC = () => {
@@ -94,6 +95,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 }) => {
   const { containerRef, startGame, pauseGame, resumeGame, resetGame } = usePixiApp();
   const status = useGameStore((state) => state.status);
+  const [showTutorial, setShowTutorial] = useState(false);
 
   const handleStart = () => {
     startGame();
@@ -128,14 +130,17 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       {status === 'idle' && (
         <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/50 backdrop-blur-sm rounded-lg">
           <DifficultySelector />
-          <button
-            onClick={handleStart}
-            className="px-8 py-4 bg-bio-primary text-bio-dark font-game font-bold text-xl rounded-lg 
-                       hover:bg-bio-secondary transition-all duration-300 
-                       shadow-neon-green hover:scale-105"
-          >
-            开始游戏
-          </button>
+          <div className="flex items-center gap-4">
+            <button
+              onClick={handleStart}
+              className="px-8 py-4 bg-bio-primary text-bio-dark font-game font-bold text-xl rounded-lg
+                         hover:bg-bio-secondary transition-all duration-300
+                         shadow-neon-green hover:scale-105"
+            >
+              开始游戏
+            </button>
+            <TutorialButton onClick={() => setShowTutorial(true)} />
+          </div>
         </div>
       )}
 
@@ -144,18 +149,19 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           <div className="flex gap-4">
             <button
               onClick={handleResume}
-              className="px-6 py-3 bg-bio-primary text-bio-dark font-game font-bold rounded-lg 
+              className="px-6 py-3 bg-bio-primary text-bio-dark font-game font-bold rounded-lg
                          hover:bg-bio-secondary transition-all duration-300"
             >
               继续
             </button>
             <button
               onClick={handleReset}
-              className="px-6 py-3 bg-gray-600 text-white font-game font-bold rounded-lg 
+              className="px-6 py-3 bg-gray-600 text-white font-game font-bold rounded-lg
                          hover:bg-gray-500 transition-all duration-300"
             >
               重新开始
             </button>
+            <TutorialButton compact onClick={() => setShowTutorial(true)} />
           </div>
         </div>
       )}
@@ -198,13 +204,16 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           <SpeedButton />
           <button
             onClick={handlePause}
-            className="px-4 py-2 bg-black/50 text-white font-game rounded 
+            className="px-4 py-2 bg-black/50 text-white font-game rounded
                        hover:bg-black/70 transition-all duration-300 border border-bio-primary/30"
           >
             暂停
           </button>
         </div>
       )}
+
+      {/* 新手教学模态弹窗 */}
+      <TutorialModal open={showTutorial} onClose={() => setShowTutorial(false)} />
     </div>
   );
 };

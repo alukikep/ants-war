@@ -290,6 +290,55 @@ export interface GameState {
   // AI 垃圾话系统
   aiTrashTalk: string;           // 当前显示的垃圾话内容
   aiTrashTalkTime: number;       // 垃圾话设置时间（用于控制显示/淡出）
+
+  // 科学家观察系统（与蚁后发言共用同一个 LLM 调用，但视角不同）
+  scientificCommentary: string;        // 当前显示的科学家评语
+  scientificCommentaryTime: number;    // 评语设置时间
+
+  // 科学家"实验性干预"——当前生效中的实验（null = 无）
+  activeExperiment: ActiveExperiment | null;
+  // 上一次已结束的实验（用于下一轮 LLM 决策时参考，避免重复同样的干预）
+  lastExperiment: ExperimentRecord | null;
+
+  // 酸液场地列表（acid_spot 实验产生的临时毒场，可叠加）
+  acidSpots: AcidSpot[];
+}
+
+// 科学家实验：当前正在生效中的干预
+export interface ActiveExperiment {
+  kind: import('../config/experiments').ExperimentKind;
+  side: import('../config/experiments').ExperimentSide;
+  magnitude: number;       // 强度（语义取决于 kind）
+  /** 绝对结束时间 — **游戏时间戳**（stats.gameTime，ms），用于引擎判断是否过期
+   *  采用游戏时间而非 performance.now()：暂停时自动冻结，3x 速下按真实时间的 1/3 推进。 */
+  endsAt: number;
+  purpose: string;         // 实验目的（一句话，由 LLM 提供）
+  /** 由谁注入（'scientist' | 'system'），方便未来扩展 */
+  source: string;
+}
+
+// 科学家实验：已结束的历史记录，供下次 advise 时参考
+export interface ExperimentRecord {
+  kind: import('../config/experiments').ExperimentKind;
+  /** 该实验注入时的游戏时间（ms） */
+  gameTime: number;
+  purpose: string;
+  side: import('../config/experiments').ExperimentSide;
+}
+
+// 酸液场地：acid_spot 实验产生的临时毒场
+export interface AcidSpot {
+  id: string;
+  /** 场地中心坐标（像素） */
+  position: { x: number; y: number };
+  /** 影响半径（像素） */
+  radius: number;
+  /** 影响哪一侧的蚂蚁（进入即受中毒伤害） */
+  affectsSide: 'player' | 'enemy' | 'both';
+  /** 每秒伤害（中毒 tick） */
+  damagePerSec: number;
+  /** 绝对结束时间 — **游戏时间戳**（stats.gameTime，ms），与 activeExperiment.endsAt 保持同一基准 */
+  endsAt: number;
 }
 
 // ============================================

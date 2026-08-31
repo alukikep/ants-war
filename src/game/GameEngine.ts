@@ -8,7 +8,40 @@ import { v4 as uuidv4 } from 'uuid';
 import { useGameStore, calculateHatcheryCost } from '../store/gameStore';
 import { GAME_CONFIG, QUEEN_CONFIG, UNLOCK_CONFIG, QUEEN_ATTACK_CONFIG, DIFFICULTY_CONFIG } from '../config/gameConfig';
 import { RANGED_CONFIG, ESCAPE_ABILITY_CONFIG, SPITTER_SLOW_CONFIG, ATTACK_SPEED_AURA_CONFIG, STINGER_ABILITY_CONFIG, TAUNT_ABILITY_CONFIG, INSTANT_KILL_CONFIG, HONEYPOT_EXPLOSION_CONFIG, HEAD_CONFIGS, THORAX_CONFIGS, ABDOMEN_CONFIGS, calculateAntStats } from '../config/partStats';
+import { OfflineScientist } from '../ai/OfflineScientist';
 import { playSound } from '../components/SoundControl';
+import { GameEvents } from '../core/Events';
+import type { ExperimentKind } from '../config/experiments';
+
+/**
+ * 模块级 helper：根据 side 和"关心的实验 kind"列表取出 magnitude。
+ *
+ * - 若 activeExperiment.kind 不在 kindFilter 中 → 返回 1（无影响）
+ * - 若 activeExperiment 已过期（endsAt <= gameTime）→ 自动清理并返回 1
+ * - 若 activeExperiment.side 不影响该 side → 返回 1（'both' 同时影响两侧）
+ * - 否则返回 magnitude
+ *
+ * 调用方按"magnitude 是直接乘数"使用即可（与 food_rate_* 语义一致）：
+ *   spawn_rate_*:  间隔 × magnitude
+ *   visibility_fog: detectionRange × magnitude
+ *   queen_attack_speed: 攻击间隔 / magnitude
+ */
+function getExperimentMagnitudeForSide(
+  side: 'player' | 'enemy',
+  ...kindFilter: ExperimentKind[]
+): number {
+  const state = useGameStore.getState();
+  const exp = state.activeExperiment;
+  if (!exp) return 1;
+  if (kindFilter.length > 0 && !kindFilter.includes(exp.kind)) return 1;
+  if (state.stats.gameTime >= exp.endsAt) {
+    // 过期自动清理
+    state.clearActiveExperiment();
+    return 1;
+  }
+  if (exp.side !== 'both' && exp.side !== side) return 1;
+  return exp.magnitude;
+}
 
 // ============================================
 // AI 决策接口
@@ -73,6 +106,14 @@ export interface AIBattleContext {
   availableHeads: HeadVariant[];
   availableThoraxes: ThoraxVariant[];
   availableAbdomens: AbdomenVariant[];
+
+  // 上一次已结束的科学家实验（避免重复同样的干预；source: types.ExperimentRecord）
+  lastExperiment?: {
+    kind: import('../config/experiments').ExperimentKind;
+    gameTime: number;
+    purpose: string;
+    side: import('../config/experiments').ExperimentSide;
+  };
 }
 
 /**
@@ -119,7 +160,7 @@ export const PART_WEIGHT_RANGE = {
 } as const;
 
 /**
- * LLM 战略顾问的输出：长期策略 + 部件权重调整 + 嘲讽语
+ * LLM 战略顾问的输出：长期策略 + 部件权重调整 + 嘲讽语 + 科学家评语/实验
  */
 export interface StrategicDirective {
   /** AI 战略模式 */
@@ -128,6 +169,26 @@ export interface StrategicDirective {
   weights: PartWeights;
   /** 战术评语，会推给 AITrashTalk UI */
   taunt?: string;
+  /** 科学家客观评语（与蚁后 taunt 对照） */
+  commentary?: ScientificCommentary;
+  /** 科学家"实验性干预"指令 */
+  experiment?: {
+    kind: import('../config/experiments').ExperimentKind;
+    durationMs: number;
+    magnitude: number;
+    side: import('../config/experiments').ExperimentSide;
+    purpose: string;
+  };
+}
+
+/**
+ * 科学家客观评语（与蚁后 taunt 共用同一个 LLM 调用，但视角不同）
+ */
+export interface ScientificCommentary {
+  /** ≤200 字中文，第三人称、实验记录腔 */
+  text: string;
+  /** 可选：玩家应关注的事件（≤80 字） */
+  highlight?: string;
 }
 
 /**
@@ -186,6 +247,20 @@ export class DefaultAIDecisionMaker implements AIDecisionMaker {
    * 阈值 2 意味着要至少差出"一段部件的强偏好 vs 不存在/极低"的差距才算值得拆。
    */
   private static readonly SCORE_GAP_THRESHOLD = 2;
+
+  /**
+   * 扩张期阈值：己方孵化室 < 此值时进入"扩张期守卫"，跳过 demolish。
+   *
+   * 设计意图：5x5 = 25 格满员；阈值 20 = 80% 满员前都算扩张期。
+   * 在扩张期内即使 scoreGap 满足拆建条件，也优先 build/upgrade/wait，
+   * 避免 AI 在早期空位充足时反复拆巢浪费 tick，导致人口停滞。
+   *
+   * 阈值选择 20 的理由：
+   * - 留出 5 个空位（20%）的迭代空间，让 25 格满员前就开始拆弱配队
+   * - 但在前 20 格（80%）保证 AI 始终在扩张，不会被 demolish 打断
+   * - 这是设计权衡：要"扩张优先"还是"迭代优先"的边界
+   */
+  private static readonly EXPANSION_PHASE_THRESHOLD = 20;
 
   /**
    * 替换全部权重。LLM 战略顾问每 ~60s 调一次。
@@ -322,6 +397,8 @@ export class DefaultAIDecisionMaker implements AIDecisionMaker {
    * - 建造"最符合 weights"的理想模板（不再用采样，改用确定性 top1）
    * - 满级场景也会主动拆建（不再死循环在 upgrade）
    * - 同一孵化室在 HATCHERY_DEMOLISH_COOLDOWN_MS 内不会被反复拆除（避免震荡）
+   * - **扩张期守卫**：己方孵化室 < EXPANSION_PHASE_THRESHOLD 时跳过 demolish，
+   *   强制走 build/upgrade/wait，避免早期空位充足时优先拆巢导致人口停滞
    */
   private decideIterate(context: AIBattleContext): AIDecision {
     const {
@@ -333,6 +410,55 @@ export class DefaultAIDecisionMaker implements AIDecisionMaker {
       availableThoraxes,
       availableAbdomens,
     } = context;
+
+    // === 扩张期守卫 ===
+    // 满员 25 格（5x5）；阈值 20 = 80% 满员前都算扩张期。
+    // 这段时间内严禁 demolish —— 即使 scoreGap 够也只 build/upgrade/wait，
+    // 避免 AI 在有空位时反复拆巢浪费 tick。
+    const isExpansionPhase = enemyHatcheries.length < DefaultAIDecisionMaker.EXPANSION_PHASE_THRESHOLD;
+    if (isExpansionPhase) {
+      // 扩张期优先 build
+      const targetTemplate = this.pickBestTemplateByWeights(
+        availableHeads,
+        availableThoraxes,
+        availableAbdomens,
+      );
+      const targetCost = calculateHatcheryCost(targetTemplate);
+
+      if (availableBuildPositions.length > 0 && enemyFood >= targetCost) {
+        const buildTemplate = this.selectTemplate(
+          availableHeads,
+          availableThoraxes,
+          availableAbdomens,
+        );
+        return {
+          action: 'build',
+          buildPosition: this.pickBuildPosition(availableBuildPositions),
+          buildTemplate,
+          reason: `[迭代][扩张期] 优先扩张，建造新孵化室(score=${this.scoreTemplateByWeights(buildTemplate)})`,
+        };
+      }
+
+      // 食物不够 build → 升级现有孵化室（按 score 升序，最差的先升）
+      if (upgradableHatcheries.length > 0) {
+        const sorted = [...upgradableHatcheries].sort(
+          (a, b) => this.scoreHatcheryByWeights(a) - this.scoreHatcheryByWeights(b),
+        );
+        for (const hatchery of sorted) {
+          if (enemyFood >= hatchery.cost) {
+            return {
+              action: 'upgrade',
+              targetHatcheryId: hatchery.id,
+              reason: `[迭代][扩张期] 攒力量，升级现有孵化室(score=${this.scoreHatcheryByWeights(hatchery)})`,
+            };
+          }
+        }
+      }
+
+      return { action: 'wait', reason: '[迭代][扩张期] 资源不足，攒食物等 build' };
+    }
+
+    // === 扩张期之后才进入完整迭代逻辑 ===
 
     // 清理过期的 demolish cooldown 条目（避免 Map 无限增长）
     // （全局时间戳方案无需清理）
@@ -436,19 +562,25 @@ export class DefaultAIDecisionMaker implements AIDecisionMaker {
 
   /**
    * 评估一个孵化室与当前 weights 的匹配度
-   * = 该孵化室三段部件在 weights 中对应的权重之和
+   * = 部件权重分 - 等级惩罚
    *
-   * 范围：0 ~ 15（每段 max=5，三段共 max=15）
-   * 得分越高代表越匹配当前 LLM 战略权重 → 不应拆除
-   * 得分越低代表越不匹配 → 应优先拆除
+   * 设计要点：
+   * - 部件权重之和范围：0 ~ 15（每段 max=5，三段共 max=15）
+   * - 等级惩罚：每升一级扣 0.5（lv1→0, lv2→0.5, lv3→1）
+   *   用意：已升级的孵化室是"沉没成本"，部件配置不算特别差就别拆；
+   *   否则满级+满员场景下，target 永远是"理想模板"(score ≈ 部件权重满分)，
+   *   而 worst 永远只能是"现存最高分"，两者 scoreGap 容易 < 阈值，
+   *   导致 AI 死锁在 wait、只囤食物不花。
+   * - score 越低代表越不匹配 → 应优先拆除
    */
   private scoreHatcheryByWeights(h: Hatchery): number {
     const w = this.weights;
-    return (
+    const partScore =
       (w.heads[h.template.head] ?? 0) +
       (w.thoraxes[h.template.thorax] ?? 0) +
-      (w.abdomens[h.template.abdomen] ?? 0)
-    );
+      (w.abdomens[h.template.abdomen] ?? 0);
+    const levelPenalty = (h.level - 1) * 0.5;
+    return partScore - levelPenalty;
   }
 
   /**
@@ -717,6 +849,13 @@ export class GameEngine {
   /** 顾问触发间隔（游戏时间，ms）。60 游戏秒 = 1x 速 60s，3x 速 20s 真实秒 */
   private static readonly ADVISOR_INTERVAL_MS = 60_000;
 
+  /** 离线实验器（没配 key 或 LLM 失败时兜底；只产出 experiment，不输出 commentary/taunt） */
+  private offlineExperimenter: OfflineScientist | null = null;
+  /** 上次调用离线实验器时的游戏时间（ms） */
+  private lastOfflineExperimentGameTime = 0;
+  /** 离线实验器触发间隔（游戏时间，ms）。比 LLM 慢一拍，避免刷屏 */
+  private static readonly OFFLINE_EXPERIMENT_INTERVAL_MS = 90_000;
+
   // 尾针甩尾事件列表（渲染器消费后清除）
   public stingerStrikeEvents: StingerStrikeEvent[] = [];
 
@@ -756,6 +895,16 @@ export class GameEngine {
     this.strategicAdvisor = advisor;
     // 重置计时器让新顾问能尽快首次执行
     this.lastAdvisorGameTime = 0;
+  }
+
+  /**
+   * 注入/卸载离线实验器（OfflineScientist）。
+   * 当 strategicAdvisor 不可用（没配 key）或失败时，引擎用 offlineExperimenter 兜底生成 experiment。
+   * 传 null 卸载。
+   */
+  setOfflineExperimenter(maker: OfflineScientist | null): void {
+    this.offlineExperimenter = maker;
+    this.lastOfflineExperimentGameTime = 0;
   }
 
   /**
@@ -837,6 +986,8 @@ export class GameEngine {
       availableHeads: state.enemyUnlockedParts.heads,
       availableThoraxes: state.enemyUnlockedParts.thoraxes,
       availableAbdomens: state.enemyUnlockedParts.abdomens,
+      // 上次实验（用于 LLM 避免重复干预）
+      lastExperiment: state.lastExperiment ?? undefined,
     };
   }
 
@@ -955,6 +1106,11 @@ export class GameEngine {
     this.lastUnlockGameTime = 0;
     // 重置战略顾问计时器（新一局让顾问能尽快首次执行）
     this.lastAdvisorGameTime = 0;
+    // 重置离线实验器
+    this.lastOfflineExperimentGameTime = 0;
+    if (this.offlineExperimenter) {
+      this.offlineExperimenter.reset();
+    }
     // 重置蚁后攻击冷却
     this.playerQueenAttackCooldown = 0;
     this.enemyQueenAttackCooldown = 0;
@@ -993,6 +1149,12 @@ export class GameEngine {
     // 更新游戏时间
     state.incrementGameTime(deltaTime * 1000);
 
+    // 科学家系统：清理过期实验与酸液场地（每帧开头做一次）
+    this.cleanupExperimentsAndAcidSpots();
+
+    // 蚁后远程攻击（应用 queen_attack_speed 实验倍率）
+    this.handleQueenAttack(deltaTime);
+
     // 生成食物
     this.handleFoodGeneration();
 
@@ -1005,6 +1167,9 @@ export class GameEngine {
     // 战略顾问（每 ~60s 调一次 LLM，调整 mode + weights）
     // 独立于 handleAIDecision 的 2s 节流，每帧都检查
     this.maybeAdvise();
+
+    // 离线实验器（每 ~90s，没配 key 或 LLM 失败时兜底；只产出 experiment）
+    this.maybeOfflineExperiment();
 
     // 孵化室生产蚂蚁
     this.handleHatcherySpawning(deltaTime);
@@ -1050,6 +1215,9 @@ export class GameEngine {
 
     // 处理蜜罐蚁死亡爆炸回复
     this.handleHoneypotExplosion();
+
+    // 科学家系统：酸液场地对场内蚂蚁的持续伤害
+    this.handleAcidSpotDamage(deltaTime);
 
     // 清理死亡蚂蚁
     this.cleanupDeadAnts();
@@ -1513,8 +1681,19 @@ export class GameEngine {
       const enemyFoodBonus = DIFFICULTY_CONFIG[state.difficulty].enemyFoodBonus;
       const enemyFoodAmount = currentFood + enemyFoodBonus + (enemyHasAdvantage ? tugOfWarFoodBonus : 0);
 
-      state.addFood('player', playerFoodAmount);
-      state.addFood('enemy', enemyFoodAmount);
+      // 科学家实验：food_rate_boost / food_rate_reduce 注入倍率
+      const playerFoodMult = this.getExperimentMagnitude('player');
+      const enemyFoodMult = this.getExperimentMagnitude('enemy');
+
+      const finalPlayer = playerFoodMult
+        ? Math.max(0, Math.round(playerFoodAmount * playerFoodMult))
+        : playerFoodAmount;
+      const finalEnemy = enemyFoodMult
+        ? Math.max(0, Math.round(enemyFoodAmount * enemyFoodMult))
+        : enemyFoodAmount;
+
+      state.addFood('player', finalPlayer);
+      state.addFood('enemy', finalEnemy);
       this.lastFoodTime = now;
     }
   }
@@ -1629,20 +1808,334 @@ export class GameEngine {
         if (!directive) return;
         defaultAI.mode = directive.mode;
         defaultAI.setWeights(directive.weights);
+
+        const storeApi = useGameStore.getState();
+
+        // 蚁后发言
         if (directive.taunt) {
           try {
-            useGameStore.getState().setAITrashTalk(directive.taunt);
+            storeApi.setAITrashTalk(directive.taunt);
           } catch {
             /* ignore */
           }
         }
+
+        // 科学家评语
+        if (directive.commentary) {
+          try {
+            storeApi.setScientificCommentary(
+              directive.commentary.text,
+              directive.commentary.highlight,
+            );
+          } catch {
+            /* ignore */
+          }
+        }
+
+        // 科学家实验（可能为 kind:'none' 即不干预）
+        if (directive.experiment) {
+          try {
+            storeApi.applyExperiment({
+              kind: directive.experiment.kind,
+              durationMs: directive.experiment.durationMs,
+              magnitude: directive.experiment.magnitude,
+              side: directive.experiment.side,
+              purpose: directive.experiment.purpose,
+            });
+
+            // acid_spot 立即在 store 里创建一片 AcidSpot
+            if (directive.experiment.kind === 'acid_spot') {
+              this.spawnAcidSpot(directive.experiment);
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+
         console.log(
-          `[StrategicAdvisor] mode=${directive.mode} taunt="${directive.taunt || ''}"`,
+          `[StrategicAdvisor] mode=${directive.mode} taunt="${directive.taunt || ''}" ` +
+            `experiment=${directive.experiment?.kind ?? 'none'}`,
         );
       })
       .catch((err) => {
         console.warn('[StrategicAdvisor] advise 失败:', err);
       });
+  }
+
+  /**
+   * 离线实验器调度：每 OFFLINE_EXPERIMENT_INTERVAL_MS 游戏秒跑一次 OfflineScientist.decide()。
+   * 只在以下情况被触发：
+   *   1. 没配 strategicAdvisor（reloadAdvisor 没注入）
+   *   2. 或上次战略调用 fallback（即上一次 advise 没成功）
+   *
+   * 产出 experiment → store.applyExperiment（与 LLM 路径完全一致的落地路径）。
+   * 不产出 commentary / taunt（科学家沉默）。
+   */
+  private maybeOfflineExperiment(): void {
+    if (!this.offlineExperimenter) return;
+    const state = useGameStore.getState();
+    const gameTime = state.stats.gameTime;
+    if (gameTime - this.lastOfflineExperimentGameTime <
+        GameEngine.OFFLINE_EXPERIMENT_INTERVAL_MS) return;
+    this.lastOfflineExperimentGameTime = gameTime;
+
+    const ctx = this.getBattleContext();
+    const exp = this.offlineExperimenter.decide(ctx);
+    if (exp.kind === 'none') return;
+
+    try {
+      state.applyExperiment({
+        kind: exp.kind,
+        durationMs: exp.durationMs,
+        magnitude: exp.magnitude,
+        side: exp.side,
+        purpose: exp.purpose,
+      });
+      if (exp.kind === 'acid_spot') {
+        this.spawnAcidSpot(exp);
+      }
+      console.log(`[OfflineScientist] experiment=${exp.kind} side=${exp.side} mag=${exp.magnitude.toFixed(2)}`);
+    } catch (err) {
+      console.warn('[OfflineScientist] 注入失败:', err);
+    }
+  }
+
+  /**
+   * 在指定一侧基地前方生成一片临时酸液毒场（acid_spot 实验）。
+   * - 半径 120px
+   * - 影响 side 对应的蚂蚁（即己方进入会被毒）
+   * - damagePerSec 与现有中毒 buff 同等级，按当前 enemyComposition 中最常见腹的 maxLv 缩放
+   */
+  private spawnAcidSpot(exp: {
+    kind: import('../config/experiments').ExperimentKind;
+    magnitude: number;
+    side: import('../config/experiments').ExperimentSide;
+  }): void {
+    const state = useGameStore.getState();
+
+    // 场地位置：在指定侧的"基地前方" 200px
+    //   side === 'player' → 玩家蚁后右侧 200px（向敌方方向）
+    //   side === 'enemy'  → 敌方蚁后左侧 200px
+    //   side === 'both'   → 地图中线
+    let pos = { x: 0, y: 300 };
+    if (exp.side === 'player') {
+      pos = { x: QUEEN_CONFIG.playerPosition.x + 200, y: 300 };
+    } else if (exp.side === 'enemy') {
+      pos = { x: QUEEN_CONFIG.enemyPosition.x - 200, y: 300 };
+    } else {
+      pos = { x: GAME_CONFIG.mapWidth / 2, y: 300 };
+    }
+
+    const damagePerSec = Math.max(20, Math.round(60 * exp.magnitude));
+    const id = `acidspot_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    // 同一类实验（acid_spot）连续触发时，保留已生效时间 —— 按游戏时间戳计算
+    const gameTime = state.stats.gameTime;
+    const remaining = state.activeExperiment?.kind === 'acid_spot'
+      ? Math.max(0, state.activeExperiment.endsAt - gameTime)
+      : 10_000;
+
+    const spot = {
+      id,
+      position: pos,
+      radius: 120,
+      affectsSide: exp.side,
+      damagePerSec,
+      endsAt: gameTime + remaining,
+    };
+
+    state.addAcidSpot(spot);
+  }
+
+  // ============================================
+  // 科学家实验系统 helper
+  // ============================================
+
+  /**
+   * 检查指定一侧是否处于某类实验中。
+   * - side: 'player' | 'enemy' —— 仅查询对应侧是否受影响（包含 'both'）
+   * - kindFilter?: 不传则只看"是否还有任何实验生效"
+   *
+   * 注意：会自动清理已过期的 activeExperiment。
+   */
+  private isExperimentActive(
+    side: 'player' | 'enemy',
+    kindFilter?: import('../config/experiments').ExperimentKind,
+  ): boolean {
+    const state = useGameStore.getState();
+    const exp = state.activeExperiment;
+    if (!exp) return false;
+    const now = state.stats.gameTime;
+    if (now >= exp.endsAt) {
+      // 过期自动清空（避免内存泄漏）
+      state.clearActiveExperiment();
+      return false;
+    }
+    if (kindFilter && exp.kind !== kindFilter) return false;
+    return exp.side === 'both' || exp.side === side;
+  }
+
+  /** 获取当前生效实验的 magnitude（如果实验作用于 side 且未过期）；否则返回 undefined。
+   *  不限定 kind —— 返回当前活动实验的 magnitude（若任何实验都在生效）。
+   *  注意：现在已被模块级 helper `getExperimentMagnitudeForSide` 取代，仅 food_rate
+   *  路径为兼容性保留。 */
+  private getExperimentMagnitude(
+    side: 'player' | 'enemy',
+  ): number | undefined {
+    const mult = getExperimentMagnitudeForSide(side);
+    return mult === 1 ? undefined : mult;
+  }
+
+  /**
+   * 每帧清理过期 AcidSpot（与 activeExperiment 同步清理）。
+   * 在 gameLoop 顶部调用。
+   *
+   * endsAt 现在是游戏时间戳（gameTime），暂停时自动冻结。
+   */
+  private cleanupExperimentsAndAcidSpots(): void {
+    const state = useGameStore.getState();
+    const now = state.stats.gameTime;
+    if (state.activeExperiment && now >= state.activeExperiment.endsAt) {
+      state.clearActiveExperiment();
+    }
+    if (state.acidSpots.length > 0) {
+      const alive = state.acidSpots.filter((s) => s.endsAt > now);
+      if (alive.length !== state.acidSpots.length) {
+        // 差异更新（保留性能，避免全量 set）
+        const removed = state.acidSpots.filter((s) => s.endsAt <= now);
+        for (const r of removed) state.removeAcidSpot(r.id);
+      }
+    }
+  }
+
+  /**
+   * 蚁后远程攻击：应用科学家实验 `queen_attack_speed`。
+   * - magnitude ∈ [1.3, 1.8]，是攻速倍率（>1 = 冷却更短 = 攻击更频）
+   * - 开火后冷却 = `QUEEN_ATTACK_CONFIG.attackInterval / magnitude`
+   * - side ∈ {'player','enemy','both'}：'both' 时两侧蚁后同时获得加成
+   * - deltaTime 来自主循环，已应用 gameSpeed 缩放（暂停时为 0 → 自动冻结）
+   */
+  private handleQueenAttack(deltaTime: number): void {
+    const state = useGameStore.getState();
+    const deltaMs = deltaTime * 1000;
+    const baseInterval = QUEEN_ATTACK_CONFIG.attackInterval;
+
+    this.playerQueenAttackCooldown = Math.max(0, this.playerQueenAttackCooldown - deltaMs);
+    this.enemyQueenAttackCooldown = Math.max(0, this.enemyQueenAttackCooldown - deltaMs);
+
+    // 取该侧的实验倍率；无实验 = 1.0（即使用基础间隔）
+    const playerMult = getExperimentMagnitudeForSide('player', 'queen_attack_speed');
+    const enemyMult = getExperimentMagnitudeForSide('enemy', 'queen_attack_speed');
+
+    const aliveAnts = state.ants.filter(a => a.state !== 'dead' && !a.isBeingExecuted);
+
+    // 玩家蚁后
+    if (this.playerQueenAttackCooldown <= 0 && state.playerQueen.hp > 0) {
+      const target = this.findNearestQueenTarget('player', aliveAnts);
+      if (target) {
+        this.fireQueenProjectile('player', QUEEN_CONFIG.playerPosition, target);
+        // 实验倍率越大 → 冷却越短
+        this.playerQueenAttackCooldown = Math.max(
+          80,
+          Math.round(baseInterval / (playerMult > 1 ? playerMult : 1)),
+        );
+        try { GameEvents.emitQueenAttack('player', target.id, QUEEN_ATTACK_CONFIG.damage); } catch { /* ignore */ }
+      }
+    }
+
+    // 敌方蚁后
+    if (this.enemyQueenAttackCooldown <= 0 && state.enemyQueen.hp > 0) {
+      const target = this.findNearestQueenTarget('enemy', aliveAnts);
+      if (target) {
+        this.fireQueenProjectile('enemy', QUEEN_CONFIG.enemyPosition, target);
+        this.enemyQueenAttackCooldown = Math.max(
+          80,
+          Math.round(baseInterval / (enemyMult > 1 ? enemyMult : 1)),
+        );
+        try { GameEvents.emitQueenAttack('enemy', target.id, QUEEN_ATTACK_CONFIG.damage); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  /** 蚁后索敌：在 attackRange 内找最近的敌方蚂蚁 */
+  private findNearestQueenTarget(side: 'player' | 'enemy', aliveAnts: Ant[]): Ant | null {
+    const queenPos = side === 'player' ? QUEEN_CONFIG.playerPosition : QUEEN_CONFIG.enemyPosition;
+    const { range } = QUEEN_ATTACK_CONFIG;
+    let nearest: Ant | null = null;
+    let nearestDist = Infinity;
+    for (const ant of aliveAnts) {
+      if (ant.side === side) continue;
+      const dx = ant.position.x - queenPos.x;
+      const dy = ant.position.y - queenPos.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist <= range && dist < nearestDist) {
+        nearestDist = dist;
+        nearest = ant;
+      }
+    }
+    return nearest;
+  }
+
+  /** 蚁后发射子弹 */
+  private fireQueenProjectile(side: 'player' | 'enemy', queenPos: { x: number; y: number }, target: Ant): void {
+    const state = useGameStore.getState();
+    const dx = target.position.x - queenPos.x;
+    const dy = target.position.y - queenPos.y;
+    const angle = Math.atan2(dy, dx);
+    state.addProjectile({
+      id: uuidv4(),
+      side,
+      ownerId: `queen-${side}`,
+      targetId: target.id,
+      damage: QUEEN_ATTACK_CONFIG.damage,
+      speed: QUEEN_ATTACK_CONFIG.projectileSpeed,
+      position: {
+        x: queenPos.x + Math.cos(angle) * 40,
+        y: queenPos.y + Math.sin(angle) * 40,
+      },
+      rotation: angle,
+      isQueenProjectile: true,
+    });
+  }
+
+  /**
+   * 处理 AcidSpot 对蚂蚁的伤害：每帧检查蚂蚁是否在 spot 半径内，
+   * 是则对 spot.affectsSide 影响的蚂蚁施加中毒 tick。
+   */
+  private handleAcidSpotDamage(deltaTime: number): void {
+    const state = useGameStore.getState();
+    if (state.acidSpots.length === 0) return;
+
+    const now = performance.now();
+    const antUpdates: { id: string; changes: Partial<Ant> }[] = [];
+
+    for (const spot of state.acidSpots) {
+      if (now >= spot.endsAt) continue;
+      const tickDamage = spot.damagePerSec * deltaTime;
+      for (const ant of state.ants) {
+        if (ant.state === 'dead') continue;
+        // 只影响 spot.affectsSide 对应阵营的蚂蚁
+        if (spot.affectsSide !== 'both' && ant.side !== spot.affectsSide) continue;
+        const dx = ant.position.x - spot.position.x;
+        const dy = ant.position.y - spot.position.y;
+        if (dx * dx + dy * dy <= spot.radius * spot.radius) {
+          const newHp = Math.max(0, ant.hp - tickDamage);
+          if (newHp !== ant.hp) {
+            antUpdates.push({
+              id: ant.id,
+              changes: {
+                hp: newHp,
+                state: newHp <= 0 ? 'dead' : ant.state,
+              },
+            });
+          }
+        }
+      }
+    }
+
+    if (antUpdates.length > 0) {
+      state.updateAnts(antUpdates);
+    }
   }
 
   /**
@@ -1685,11 +2178,19 @@ export class GameEngine {
 
   /**
    * 计算当前孵化间隔（初始4秒，每过1分钟延长1秒）
+   *
+   * 应用科学家实验 `spawn_rate_boost` / `spawn_rate_reduce`：
+   * - magnitude > 1 → 间隔变长（孵化抑制）
+   * - magnitude < 1 → 间隔变短（孵化加速）
+   * - magnitude 是直接乘数，与 food_rate_* 保持一致语义
    */
-  private getCurrentSpawnInterval(): number {
+  private getCurrentSpawnInterval(side?: 'player' | 'enemy'): number {
     const state = useGameStore.getState();
     const minutesElapsed = Math.floor(state.stats.gameTime / 60000);
-    return state.config.spawnInterval + minutesElapsed * 1000;
+    const baseInterval = state.config.spawnInterval + minutesElapsed * 1000;
+    if (!side) return baseInterval;
+    const mult = getExperimentMagnitudeForSide(side, 'spawn_rate_boost', 'spawn_rate_reduce');
+    return Math.max(500, baseInterval * mult); // 下限 500ms 防止除零/超快
   }
 
   private handleHatcherySpawning(deltaTime: number) {
@@ -1698,9 +2199,6 @@ export class GameEngine {
 
     // 更新孵化室冷却
     state.updateHatcheryCooldowns(deltaTime * 1000);
-
-    // 计算当前孵化间隔
-    const currentSpawnInterval = this.getCurrentSpawnInterval();
 
     // 检查每个孵化室是否可以生产
     const updatedState = useGameStore.getState();
@@ -1724,7 +2222,8 @@ export class GameEngine {
         // 播放孵化音效
         playSound.spawn(hatchery.side);
 
-        // 重置冷却时间（使用动态孵化间隔）
+        // 重置冷却时间（按 side 应用 spawn_rate 实验倍率）
+        const currentSpawnInterval = this.getCurrentSpawnInterval(hatchery.side);
         useGameStore.setState((s) => ({
           hatcheries: s.hatcheries.map(h =>
             h.id === hatchery.id
@@ -1782,6 +2281,11 @@ export class GameEngine {
       // 远程蚂蚁的攻击范围使用 ant.attackRange，近战使用 collisionDistance
       const effectiveAttackRange = ant.isRanged ? ant.attackRange : collisionDistance;
 
+      // 应用 visibility_fog 实验：magnitude ∈ [0.4, 0.7] 是直接倍率，索敌范围缩短
+      // 仅影响该蚂蚁所属侧的索敌判定（'both' 时两侧都生效）
+      const fogMult = getExperimentMagnitudeForSide(ant.side, 'visibility_fog');
+      const effectiveDetectionRange = fogMult !== 1 ? detectionRange * fogMult : detectionRange;
+
       // 检查是否在攻击范围内
       if (nearestDistance <= effectiveAttackRange) {
         if (ant.isRanged) {
@@ -1805,7 +2309,7 @@ export class GameEngine {
         }
       }
       // 检查是否在索敌范围内（远程单位索敌范围等于攻击范围）
-      else if (nearestDistance <= Math.max(detectionRange, effectiveAttackRange)) {
+      else if (nearestDistance <= Math.max(effectiveDetectionRange, effectiveAttackRange)) {
         // 锁定目标，开始追击
         if (ant.state !== 'chasing' || ant.targetId !== nearestEnemy.id) {
           updates.push({

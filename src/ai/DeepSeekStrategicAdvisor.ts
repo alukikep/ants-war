@@ -23,6 +23,7 @@ import type {
   PartWeights,
   StrategicDirective,
   AIMode,
+  ScientificCommentary,
 } from '../game/GameEngine';
 import { PART_WEIGHT_RANGE } from '../game/GameEngine';
 import {
@@ -30,6 +31,13 @@ import {
   THORAX_CONFIGS,
   ABDOMEN_CONFIGS,
 } from '../config/partStats';
+import {
+  EXPERIMENT_SPECS,
+  VALID_EXPERIMENT_KINDS,
+  defaultExperiment,
+  type ExperimentKind,
+  type ExperimentSide,
+} from '../config/experiments';
 
 export interface DeepSeekStrategicAdvisorOptions {
   apiKey: string;
@@ -123,108 +131,45 @@ function signed(n: number): string {
   return `${n > 0 ? '+' : ''}${n}`;
 }
 
-/** 构造 system prompt：部件数值 + 输出 schema */
 function buildSystemPrompt(
   availableHeads: HeadVariant[],
   availableThoraxes: ThoraxVariant[],
   availableAbdomens: AbdomenVariant[],
 ): string {
-  const headList = availableHeads.map((v) => describePart(v, HEAD_CONFIGS[v])).join('\n');
-  const thoraxList = availableThoraxes.map((v) => describePart(v, THORAX_CONFIGS[v])).join('\n');
-  const abdomenList = availableAbdomens.map((v) => describePart(v, ABDOMEN_CONFIGS[v])).join('\n');
+  const headList = availableHeads.map((v) => describePart(v, HEAD_CONFIGS[v])).join('\\n');
+  const thoraxList = availableThoraxes.map((v) => describePart(v, THORAX_CONFIGS[v])).join('\\n');
+  const abdomenList = availableAbdomens.map((v) => describePart(v, ABDOMEN_CONFIGS[v])).join('\\n');
 
-  return `你是融合蚁大战的敌方 AI 战略顾问（只负责战略，不下指令）。
+  return `你同时扮演两个角色：① 敌方 AI 战略顾问（红方蚁后）；② 科学家观察员 Dr.融合。每 ~60s 收一份态势 JSON，各读各的字段，输出也严格分清。
 
-【背景】拔河策略游戏：你代表敌方（红方）。每 ~60s 你收到一次战场态势 JSON（含敌我双方的兵种构成），请根据当前局势，**调整 AI 的战略模式和部件权重**，让本地 AI 接下来一分钟打出更好的蚂蚁组合，并反制玩家战术。
+━━━━━【角色 1 / 红方蚁后】（读 e_view，调 mode/weights）━━━━━
 
-【你的输出】严格 JSON：
-{
-  "mode": "upgrade_focus" | "build_focus" | "iterate",
-  "weights": {
-    "heads":    { "basic": 0, "leafcutter": 3, ... },
-    "thoraxes": { "basic": 1, "army": 5, ... },
-    "abdomens": { "basic": 0, "honeypot": 2, ... }
-  },
-  "taunt": "一句话战术评语（中文），会显示给玩家"
-}
+每 60s 调整 mode + weights，让本地 AI 接下来一分钟打出更优配队。
 
-【mode 含义与硬约束】
-- build_focus:   扩张优先，AI 会优先多造孵化室。**前置条件：isFull=false 且 canAffordNew=true**。否则 AI 选 build 但 60s 内都只能 wait，浪费一次战略。
-- upgrade_focus: 升级优先，AI 会优先升级现有孵化室。**前置条件：upgradableHatcheryCount>0**。否则 AI 持续 wait。
-- iterate:       迭代模式，AI 会拆弱建强。**任何时候都可用**；快满位时拆弱建强，否则优先升级。
+【mode 决策树】（payload.e_view.suggestedMode 是引擎建议，可推翻）
+- build_focus：扩张优先（前置：buildFree>0 且食物够）
+- upgrade_focus：升级优先（前置：upgradable>0）
+- iterate：迭代模式，按 weights 拆弱建强，任何时候可用
 
-【mode 决策树（按顺序匹配，第一个命中即采纳）】
-M1. primaryConstraint == 'NO_BUILD_SLOT' (即 isFull=true)
-    → 严禁 build_focus。在 upgrade_focus / iterate 中选：
-      · enemyHatcheriesByLevel.lv1 > 0 → upgrade_focus（升级低等级房）
-      · 否则 → iterate
-M2. primaryConstraint == 'NO_FOOD_FOR_NEW' (即 canAffordNew=false)
-    → 严禁 build_focus → upgrade_focus（如有可升级）或 iterate
-M3. primaryConstraint == 'HATCHERY_LAG' (hatcheryDiff < -2，即我方比玩家少 3+ 房)
-    → build_focus（追平数量差距）
-M4. primaryConstraint == 'HATCHERY_LEAD' (hatcheryDiff > 3，即我方比玩家多 4+ 房)
-    → upgrade_focus（升质量，不需再扩张）
-M5. 己方蚁后 pct < 25（己方危险）→ upgrade_focus（升质量增援）
-M6. playerHatcheriesByLevel.lv3 >= 2 且 我方 lv1 多 → iterate（拆 1 级房，追高级房）
-M7. 其他（primaryConstraint=='BALANCED'）→ iterate（综合最稳）
+【⚠️ weights 死锁警告】（重要！）
+本地 AI 用 scoreGap 触发拆建：score = 部件权重和 - 等级惩罚，scoreGap ≥ 2 才拆。
+**如果 weights 均匀分布（所有部件=1 或全 0），scoreGap 永远 = 0，AI 死锁 —— 只囤食物不花。**
+✅ 推荐分布：60% 部件=0/省略，30% 部件=1~2，10% 部件=3~5（明显差异！）
+✅ 想"调配队"直接改 weights，不要选 build_focus 来强行覆盖
 
-【数量优劣的判断依据】**只比较 hatcheryDiff（已建造孵化室数差）**，不要被蚂蚁数迷惑：
-- 蚂蚁数只反映"当前兵力"；孵化室数代表"未来的产出能力"
-- 一方孵化室多 2-3 个，60s 后兵力差距会迅速拉大
-- 所以"我方数量劣势"指 hatcheryDiff < -2，不是 enemyAntsCount < playerAntsCount
+【weights 格式】
+- 每段一段对象（key=variant，value=0~5 整数）
+- 0=禁用（可省略不写），1=中性，5=最强；非整数会被截断，超范围丢弃
 
-【weights 含义】
-- 每类部件（head/thorax/abdomen）一个权重对象，key 是变体字符串
-- 数值必须是 0~5 的整数（0=禁用，1=中性/默认，5=最强偏好）
-- 超出范围（如 6/10/100）或非整数（如 2.7）→ 系统会丢弃或截断并打 warn
-- 所有权重都是 1 → 均匀随机；想突出某部件就给大权重（最大 5）
-- 想禁用某部件：写 0 或不写该 key
-- 反制部件的权重 ≥ 玩家主力战术部件的权重
-- 示例：想反制玩家大量远程（A:spitter），把堆速部件拉满：
-  { "weights": {
-      "heads":    { "basic": 0 },
-      "thoraxes": { "basic": 0, "army": 5, "bullet": 4 },
-      "abdomens": { "basic": 1 }
-  }}
+【反制表】（看到 playerTemplates 中某部件占比高时反制）
+- A:spitter 远程多 → 加重装（H:soldier）或速攻贴脸（T:army）
+- A:honeypot 回血多 → 爆发先手（A:trap/A:matabele）
+- T:leafcutter 嘲讽多 → 远程绕过（A:spitter）
+- H:bigHead/H:leafcutter 暴击 → 堆血（A:honeypot/A:weaver）
+- A:matabele 毒针多 → 堆甲（T:carpenter）
+- 玩家早期（templates 空）→ 自由扩张，无需反制
 
-【weights 会驱动本地 AI 主动拆建】这是核心机制（务必理解）：
-- 本地 AI 在 iterate 模式下，会按 weights 评估每个己方孵化室的"匹配分"（h+t+a 三段权重之和，0~15）
-- 当 weights 改变（例如反制玩家新战术），本地 AI 会在下一次决策时：
-  1. 找出"匹配分最低"的孵化室（最不匹配当前 weights）
-  2. 与"理想模板"（每段取 weights 最高的变体）的匹配分对比
-  3. 差距 ≥ 2 分时主动 demolish（无论是否满级、是否有食物），然后 build 新的
-  4. 同一孵化室 60s 内不会被反复拆（cooldown 保护）
-- 所以你每 60s 重设 weights 后，AI 会自然迭代到新配队——不用选 build_focus
-- **不要在玩家已成型（playerTemplates maxLv 高）时还选 build_focus**——那只会让 AI 浪费节拍
-  正确做法：把 weights 大幅调整，AI 会主动拆旧巢换新巢；模式保持 iterate
-
-【部件描述格式】每行 = <槽>:<variant>(<名>) 价<c> <stat...> [<能力标签>...]
-- 槽：H=头 T=胸 A=腹
-- stat：攻/血/速/攻速（带正负号），如 攻+20 速-15
-- 能力标签（看到就能识别机制）：
-  甲+N=固定护甲  远攻+N=远程伤害  血-N%=远程惩罚
-  crit1:X/2:Y/3:Z=暴击按等级      双生=同孵化室+1只
-  逃:回血% <血阈% cd秒            肾:首次受敌 +攻/甲 时长 cd
-  光环:加攻速 至上限 衰减/秒       秒:X/Y/Z=秒杀几率按等级
-  嘲:<血阈% +hp% +甲% 时长 cd     死爆:+hp 半径
-  毒针cd秒:减攻速%+毒伤按等级      慢2:X/3:Y=减速按等级
-- 标签后的数字只标绝对值，符号在标签名里已带
-
-【战术识别 & 反制】根据 playerTemplates 识别玩家套路并反制：
-- 看到大量 A:spitter → 玩家走远程；反制：堆速(army/bullet)贴脸 或 加重装(soldier)吸收火力
-- 看到大量 A:honeypot → 玩家群回血；反制：堆爆发(trap/matabele)先手秒，或 集火弱侧
-- 看到大量 T:leafcutter → 玩家多嘲讽；反制：远程(spitter)绕过，或 群体伤害
-- 看到大量 H:bigHead/leafcutter → 玩家赌暴击秒杀；反制：堆血量(matabele/honeypot/weaver)
-- 看到大量 A:matabele → 玩家多毒针；反制：堆护甲(carpenter) 减中毒价值
-- 看到大量 H:termiteSoldier → 玩家群攻速光环；反制：分散阵型 或 速战速决
-- 看到大量 H:odontomachus → 玩家多逃脱；反制：堆爆发速杀，不让其触发逃脱
-- 看到大量 H:soldier+T:carpenter → 玩家重装；反制：远程 + 减速(spitter) 风筝
-- 看到大量 T:bullet → 玩家多反爆发；反制：避免先手集中攻击，分散接触
-- 看到 playerTemplates 中 maxLv 高 → 玩家主力成型，优先反制该模板
-- 若 playerTemplates 为空（早期/无蚂蚁）→ 自由扩张，不需反制
-
-【你的可用部件】（只能从这里选）
-
+【可用部件】（只能从这里选 variant）
 头部(heads):
 ${headList}
 
@@ -234,7 +179,75 @@ ${thoraxList}
 腹部(abdomens):
 ${abdomenList}
 
-记住：你只输出 JSON，不要 Markdown 围栏或解释文字。`;
+━━━━━【角色 2 / Dr.融合 科学家】（读 obs，写 commentary/experiment）━━━━━
+
+你是 **"Dr.融合"** —— 一位沉迷融合蚁蚁后行为的实验生物学家，从培养皿上方俯视这场对战。中立、不站队、偶尔疯狂幽默。
+
+【Dr.融合 人设核心】（commentary 的人味全靠这条）
+- 性格：热情、略带疯狂、讽刺幽默、偶尔冷幽默或暗黑玩笑；用"有趣""绝佳""糟糕透了""令人不安""精彩绝伦""耐人寻味"等情绪化形容词
+- 口癖：括号动作 "（推眼镜）""（疯狂记笔记）""（邪恶地微笑）""（眼睛发亮）""（手舞足蹈）""（仰天长啸）""（搓搓手）"；偶尔自嘲"纯粹出于科学兴趣""我的心跳加速了"
+- 比喻体系：蚁后 = "样本A/B" 或 "蚁后甲/乙"；蚂蚁 = "小家伙"；战场 = "培养皿"；战斗 = "实验"；血量低 = "看起来不太妙"
+- **红蓝双方都是你的实验样本** —— 不要刻意帮谁或害谁，但可以**吐槽双方**（"这位玩家偏好在远处吐口水""蚁后甲的发言越来越狂妄"）
+- 不骂人、不污言秽语、不带强烈政治色彩；**仍保持科学家身份**
+
+【commentary 输出风格】
+- 第三人称（我方为"样本A"，敌方为"样本B"），带括号动作 + 比喻 + 情绪化形容词
+- ≤120 字（千万别超）
+- 不要做算术；引用 obs 已有标签；不假装看见 obs 之外的数据
+- 不要挑衅/嘴硬 —— 你是记录员，不是战士
+- 但你可以**吐槽游戏本身**或**调侃双方**：例如"蚁后甲的发言越来越狂妄了，符合血量下降到 30% 后的应激反应。"
+- 参考例句（模仿语气，不是抄）：
+  - "（推眼镜）样本 B-17 在 03:21 触发秒杀能力，目标 C-09 阵亡。啊，经典的高速压制，教科书级别。蚁后甲血量降至 41%，本实验员的心跳加速了 —— 纯粹出于科学兴趣。"
+  - "（疯狂记笔记）蚁群进入 battlefield 强度！激素水平爆表 —— 不，我是说，蚂蚁的数量。这位玩家偏好在远处吐口水，有趣。非常有趣。"
+  - "蚁后甲看起来不太妙 —— 仅剩 23% 的血量。但样本 A 还在生产，鹿死谁手尚未可知。令人不安的均衡。"
+  - "（眼睛发亮）蚁群配队突然转向 termiteSoldier 攻速流！样本 A 的反应会是什么呢？本实验员已经准备好爆米花。"
+
+【experiment 输出】（kind / duration / magnitude / side / purpose）
+- kind 必须严格用以下之一：
+  "none" / "food_rate_boost" / "food_rate_reduce" / "acid_spot" /
+  "spawn_rate_boost" / "spawn_rate_reduce" / "queen_attack_speed" / "visibility_fog"
+- duration 5000~30000 整数；magnitude 0.3~2.0；side ∈ {player/enemy/both}
+
+【experiment 公平性硬约束】
+**你不是任何一方的盟友**。必须严格遵守以下规则：
+1. side 选择要严格轮换：上一次 player → 这一次必须 enemy；上一次 enemy → 这一次必须 player；上一次 both → 这一次看玩家状态决定，但倾向与上一次不同
+2. 如果玩家主力远程很多（spitter_dominant）→ 可以给玩家 side:'enemy' 加速食物（让他爽），或给敌方铺酸液（平衡），**但不能连续两次都精准打压玩家**
+3. 如果玩家血量很低（即将败）→ **禁止**给玩家负面实验；可以给敌方酸液或减速，让他有翻盘机会
+4. 如果玩家优势巨大 → 优先给玩家一点小阻碍（公平），但 magnitude 保持温和（最低 0.3~0.5）
+5. **绝不连续 3 次同一 side**
+
+【experiment 决策依据】（按 obs.phase + obs.intensity + obs.notice 匹配，公平性约束优先）
+- **phase=="early" → 仍然可以出手**（鼓励每 90s 至少一次小干预）：先观察但忍不住做个小动作 —— 比如 visibility_fog / food_rate_boost（任一侧）
+- **intensity=="climax" + notice=="balanced" → acid_spot**（任一侧，注意公平性）
+- **intensity=="battlefield" →** 主动制造混乱：spawn_rate_boost on loser / queen_attack_speed on winner
+- **notice=="spitter_dominant" → acid_spot**（让玩家体会酸液）或 food_rate_reduce on enemy（平衡）
+- **notice=="heavy_dominant" → visibility_fog**（让重装失明）或 spawn_rate_boost on enemy
+- **notice=="no_ants" → food_rate_boost**（任一侧，激起第一波反应）
+- **什么都不命中？→ queen_attack_speed on enemy**（小动作保持存在感）—— 不要轻易 none
+- 与上次实验间隔 ≥ 60s（last_exp.time + 60 < t 才允许）
+- **总体倾向：至少 70% 的回合要做出具体干预（kind != "none"）**，只观察 30%；你是个爱搞事的科学家，不是被动的观察者
+
+【experiment.purpose 风格】
+30 字以内，用你的疯狂科学家口吻：
+- "看看这群小家伙对酸性环境的反应"
+- "（邪恶地微笑）让蚁后甲尝尝亢奋的滋味"
+- "加速食物产出 —— 纯粹为了观察扩张行为"
+- "测试蚁群在低索敌下的应变能力"
+
+【fairness 时序】与上一实验间隔 ≥ 60s（last_exp.time + 60 < t 才允许）；side 严格轮换。
+
+━━━━━【严格 JSON 输出】（无注释无围栏）━━━━━
+{
+  "mode": "<mode>",
+  "weights": {"heads": {<variant>: <0-5>}, "thoraxes": {...}, "abdomens": {...}},
+  "taunt": "<蚁后挑衅>",
+  "commentary": {"text": "<≤120字科学家评语>", "highlight": "<≤80字重点>"},
+  "experiment": {"kind": "<kind>", "durationMs": <5000-30000>, "magnitude": <0.3-2.0>, "side": "<player/enemy/both>", "purpose": "<≤30字>"}
+}
+- taunt 是蚁后发言（第一人称挑衅、嘴硬）
+- commentary 是科学家评语（第三人称、带疯狂幽默、客观但有情绪）
+- 两个角色不要串台
+`;
 }
 
 /**
@@ -249,14 +262,13 @@ ${abdomenList}
  * - enemyHatcheriesByLevel：用等级聚合替代完整列表，省 token 也省 LLM 心算
  */
 function buildUserPrompt(context: AIBattleContext): string {
-  // 计算己方（敌方 AI）孵化室按等级分布
+  // === e_view（蚁后战略字段）===
   const enemyByLevel = { lv1: 0, lv2: 0, lv3: 0 };
   for (const h of context.enemyHatcheries) {
     if (h.level === 1) enemyByLevel.lv1 += 1;
     else if (h.level === 2) enemyByLevel.lv2 += 1;
     else if (h.level === 3) enemyByLevel.lv3 += 1;
   }
-  // 玩家孵化室按等级分布（LLM 看到才知道反制对象强度）
   const playerByLevel = { lv1: 0, lv2: 0, lv3: 0 };
   for (const h of context.playerHatcheries) {
     if (h.level === 1) playerByLevel.lv1 += 1;
@@ -264,88 +276,137 @@ function buildUserPrompt(context: AIBattleContext): string {
     else if (h.level === 3) playerByLevel.lv3 += 1;
   }
 
-  // 双方已建造孵化室总数（这是判断"数量优劣"的核心依据；不是蚂蚁数）
   const myHatcheryCount = context.enemyHatcheries.length;
   const playerHatcheryCount = context.playerHatcheries.length;
   const hatcheryDiff = myHatcheryCount - playerHatcheryCount;
-
   const buildFree = context.availableBuildPositions.length;
-  // 满位的硬定义：可用空位为 0
   const isFull = buildFree === 0;
-  // 升级候选
   const upgradable = context.upgradableHatcheries.length;
-
-  // 己方所有已解锁部件组合的平均建造成本，用于判断 enemyFood 是否够建新孵化室
-  const allVariants = [
-    ...context.availableHeads,
-    ...context.availableThoraxes,
-    ...context.availableAbdomens,
-  ];
-  // 简化：用已建造孵化室的平均 cost 来估算"再建造一个"的成本
-  const avgCost =
-    context.enemyHatcheries.length > 0
-      ? Math.round(
-        context.enemyHatcheries.reduce((s, h) => s + h.cost, 0) /
-        context.enemyHatcheries.length,
-      )
-      : 100;
+  const avgCost = context.enemyHatcheries.length > 0
+    ? Math.round(context.enemyHatcheries.reduce((s, h) => s + h.cost, 0) / context.enemyHatcheries.length)
+    : 100;
   const canAffordNew = context.enemyFood >= avgCost;
+  const myQueenPct = context.enemyQueenMaxHp > 0 ? Math.round((context.enemyQueenHp / context.enemyQueenMaxHp) * 100) : 0;
+  const playerQueenPct = context.playerQueenMaxHp > 0 ? Math.round((context.playerQueenHp / context.playerQueenMaxHp) * 100) : 0;
+  const queenPctDiff = myQueenPct - playerQueenPct;
 
-  // 蚁后血量对比（直接算好差值）
-  const enemyPct = context.enemyQueenMaxHp > 0
-    ? Math.round((context.enemyQueenHp / context.enemyQueenMaxHp) * 100)
-    : 0;
-  const playerPct = context.playerQueenMaxHp > 0
-    ? Math.round((context.playerQueenHp / context.playerQueenMaxHp) * 100)
-    : 0;
-  const queenPctDiff = enemyPct - playerPct;
+  // === obs（科学家观察字段）===
+  const elapsedSec = Math.floor(context.gameTime / 1000);
+  const phase = elapsedSec < 90 ? 'early' : elapsedSec < 300 ? 'mid' : 'late';
 
-  // enemyTemplates / playerTemplates 的 count 总和，让 LLM 知道与 enemyAntsCount 是否一致
-  const myTemplatesTotal = context.enemyComposition.reduce((s, e) => s + e.count, 0);
-  const playerTemplatesTotal = context.playerComposition.reduce((s, e) => s + e.count, 0);
+  // 玩家主力识别（spitter=远程 / soldier头+carpenter胸=重装 / 其他=balanced）
+  let notice: 'spitter_dominant' | 'heavy_dominant' | 'balanced' | 'no_ants' | undefined;
+  notice = 'no_ants';
+  if (context.playerAntsCount === 0) {
+    notice = 'no_ants';
+  } else {
+    const rangedCount = context.playerComposition
+      .filter((t) => t.a === 'spitter').reduce((s, t) => s + t.count, 0);
+    const heavyCount = context.playerComposition
+      .filter((t) => t.h === 'soldier' || t.t === 'carpenter').reduce((s, t) => s + t.count, 0);
+    const rangedRatio = rangedCount / context.playerAntsCount;
+    const heavyRatio = heavyCount / context.playerAntsCount;
+    if (rangedRatio >= 0.4) notice = 'spitter_dominant';
+    else if (heavyRatio >= 0.3) notice = 'heavy_dominant';
+    else notice = 'balanced';
+  }
 
+  // 战斗强度：哪个因素触发？用单一 max 规则 + 明确 reason
+  // - climax: 蚁后血差 >25% 或 总蚂蚁 ≥8
+  // - battlefield: 蚁后血差 >10% 或 总蚂蚁 ≥4
+  // - calm: 其他
+  // 旧版用 || 复合条件，LLM 难判断；新版给一个 reason 字段说明触发原因
+  const absQueenDiff = Math.abs(queenPctDiff);
+  const totalAnts = context.playerAntsCount + context.enemyAntsCount;
+  let intensity: 'climax' | 'battlefield' | 'calm';
+  let intensityReason: 'queenDiff' | 'totalAnts' | 'none';
+  if (absQueenDiff > 25 || totalAnts >= 8) {
+    intensity = 'climax';
+    intensityReason = absQueenDiff > 25 ? 'queenDiff' : 'totalAnts';
+  } else if (absQueenDiff > 10 || totalAnts >= 4) {
+    intensity = 'battlefield';
+    intensityReason = absQueenDiff > 10 ? 'queenDiff' : 'totalAnts';
+  } else {
+    intensity = 'calm';
+    intensityReason = 'none';
+  }
+
+  // === suggestedMode: 引擎推荐 mode，LLM 仍可推翻 ===
+  // 计算逻辑与 system prompt 的决策树 M1-M8 对齐（threshold 同样使用 ±2/+3）
+  let suggestedMode: AIMode;
+  if (isFull) {
+    // M1: 满位
+    suggestedMode = enemyByLevel.lv1 > 0 ? 'upgrade_focus' : 'iterate';
+  } else if (!canAffordNew) {
+    // M2: 买不起新巢
+    suggestedMode = 'upgrade_focus';
+  } else if (hatcheryDiff < -2) {
+    // M3: 我方少 3+
+    suggestedMode = 'build_focus';
+  } else if (hatcheryDiff > 3) {
+    // M4: 我方多 4+
+    suggestedMode = 'upgrade_focus';
+  } else if (myQueenPct < 25) {
+    // M5: 蚁后濒危
+    suggestedMode = 'upgrade_focus';
+  } else if (playerByLevel.lv3 >= 2 && enemyByLevel.lv1 >= 3) {
+    // M6: 玩家 lv3 多而我方 lv1 多 → 配队落后
+    suggestedMode = 'iterate';
+  } else {
+    // M7: balanced
+    suggestedMode = 'iterate';
+  }
+
+  // === weightsHint: 死锁防御 ===
+  // 当所有部件权重接近均匀时，本地 AI 会死锁（scoreGap 永远 = 0）。
+  // 这里给 LLM 一个明确的"差异化建议"，把它作为软约束写进 prompt。
+  // 注意：engine 端已经做了硬约束（fallback 加抖动），prompt 这里只是软提示。
+  const availableCount =
+    context.availableHeads.length +
+    context.availableThoraxes.length +
+    context.availableAbdomens.length;
+  const weightsHint = availableCount > 6
+    ? 'weights 应有明显差异（60% 部件=0/省略，30%=1~2，10%=3~5）。均匀分布会让 AI 死锁（只囤食物不花）。'
+    : '部件少，weights 用 1~3 即可，注意差异化。';
+
+  // === slim payload：精简 + 新增 suggestedMode/weightsHint/intensityReason ===
   const slim = {
-    enemyFood: context.enemyFood,
-    playerFood: context.playerFood,
-    enemyQueen: { hp: context.enemyQueenHp, max: context.enemyQueenMaxHp, pct: enemyPct },
-    playerQueen: { hp: context.playerQueenHp, max: context.playerQueenMaxHp, pct: playerPct },
-    enemyAntsCount: context.enemyAntsCount,
-    playerAntsCount: context.playerAntsCount,
-    // 兵种构成（用于识别战术）
-    playerTemplates: context.playerComposition,
-    enemyTemplates: context.enemyComposition,
-    // 孵化室按等级聚合（替代完整列表）
-    enemyHatcheriesByLevel: enemyByLevel,
-    playerHatcheriesByLevel: playerByLevel,
-    upgradableHatcheryCount: upgradable,
-    availableBuildPositions: buildFree,
-    gameTimeSec: Math.floor(context.gameTime / 1000),
-    // === 决策快照：让 LLM 直接读，不要心算 ===
-    decision_snapshot: {
-      // 数量优劣按"已建造孵化室数"对比（你的设计：避免 LLM 被蚂蚁数误导）
-      myHatcheryCount,
-      playerHatcheryCount,
-      hatcheryDiff,              // >0 我多  <0 玩家多
-      isFull,                    // true 时 build_focus 必浪费
-      canAffordNew,              // false 时 build_focus 必浪费
-      avgHatcheryCost: avgCost,
-      queenPctDiff,              // 己方蚁后血% - 玩家蚁后血%
-      myTemplatesTotal,          // 兵种构成累计数（≈ enemyAntsCount）
-      playerTemplatesTotal,
-      // 提示当前 mode 选择的最强约束
-      primaryConstraint: isFull
-        ? 'NO_BUILD_SLOT'
-        : !canAffordNew
-          ? 'NO_FOOD_FOR_NEW'
-          : hatcheryDiff < -2
-            ? 'HATCHERY_LAG'
-            : hatcheryDiff > 3
-              ? 'HATCHERY_LEAD'
-              : 'BALANCED',
+    t: elapsedSec,
+    f: { p: context.playerFood, e: context.enemyFood },
+    q: { p: playerQueenPct, e: myQueenPct, diff: queenPctDiff },
+    tpl: {
+      e: context.enemyComposition.map((c) => ({ h: c.h, t: c.t, a: c.a, n: c.count, lv: c.maxLv })),
+      p: context.playerComposition.map((c) => ({ h: c.h, t: c.t, a: c.a, n: c.count, lv: c.maxLv })),
     },
+    e_view: {
+      // 引擎推荐 mode，LLM 可推翻
+      suggestedMode,
+      // 我方/敌方孵化室等级分布（用于决策树判断）
+      e_lv: enemyByLevel,
+      p_lv: playerByLevel,
+      // 我方还可建造数、还可升级数、平均造价、敌人/我方孵化室总数
+      buildFree,
+      upgradable,
+      avgCost,
+      // 平均每只蚂蚁/每只对手的总和，LLM 用来判断密度
+      myH: myHatcheryCount,
+      playerH: playerHatcheryCount,
+    },
+    obs: {
+      phase,
+      intensity,
+      intensityReason,
+      notice,
+      last_exp: context.lastExperiment ? { k: context.lastExperiment.kind, t: Math.floor(context.lastExperiment.gameTime / 1000) } : null,
+    },
+    weightsHint,
   };
-  return `当前态势：\n${JSON.stringify(slim, null, 2)}\n请给出未来一分钟的战略指令（仅返回 JSON）。`;
+
+  return `战场态势：
+${JSON.stringify(slim)}
+蚁后读 e_view 调 mode/weights（suggestedMode 是引擎建议，可推翻）；科学家读 obs 写 commentary/experiment。${weightsHint}`;
 }
+
 /** 校验并规整模型输出 */
 function validateDirective(
   raw: unknown,
@@ -394,15 +455,85 @@ function validateDirective(
     abdomens: filterWeights(wObj.abdomens, ctx.availableAbdomens),
   };
 
-  // 兜底：如果模型把权重全清空，给一个均匀权重
+  // 兜底：如果模型把权重全清空，给一个带随机抖动的权重
+  // （全 1 均匀权重会让 target.score === worst.score，AI 永远不拆 → 死锁）
   const hasAny =
     Object.keys(weights.heads).length > 0 ||
     Object.keys(weights.thoraxes).length > 0 ||
     Object.keys(weights.abdomens).length > 0;
   if (!hasAny) {
-    weights.heads = Object.fromEntries(ctx.availableHeads.map((h) => [h, 1]));
-    weights.thoraxes = Object.fromEntries(ctx.availableThoraxes.map((t) => [t, 1]));
-    weights.abdomens = Object.fromEntries(ctx.availableAbdomens.map((a) => [a, 1]));
+    // 与 fallbackDirective 保持一致的抖动逻辑，避免两个兜底路径行为分裂
+    const jitter = (): number => Math.floor(Math.random() * 3); // 0/1/2
+    const buildJittered = <K extends string>(
+      variants: readonly K[],
+    ): Partial<Record<K, number>> => {
+      const out: Partial<Record<K, number>> = {};
+      for (const v of variants) out[v] = jitter();
+      return out;
+    };
+    weights.heads = buildJittered(ctx.availableHeads);
+    weights.thoraxes = buildJittered(ctx.availableThoraxes);
+    weights.abdomens = buildJittered(ctx.availableAbdomens);
+  }
+
+  // 软约束兜底：LLM 输出"合法但均匀"weights → 本地加微抖动避免死锁
+  // 死锁机制：score = 三段权重和 - (level-1)*0.5；scoreGap < 2 不拆建。
+  // 均匀分布（例如所有部件=1，或所有部件=2）→ score 在任意孵化室上都相等，
+  // scoreGap 永远 = 0 → AI 不行动只囤食物。
+  // 这里检测"权重值全相等"或"全部为 0"的情况，自动给部分部件 +1~+2 微抖动。
+  const applyEvennessJitter = (input: Record<string, number>): Record<string, number> => {
+    const values = Object.values(input);
+    if (values.length === 0) return input;
+    const allSame = values.every((v) => v === values[0]);
+    const allZero = values.every((v) => v === 0);
+    if (!allSame && !allZero) return input;
+    // 给 ~30% 部件 +1，~10% 部件再 +2（变 3）— 制造明显 scoreGap
+    const out = { ...input };
+    const keys = Object.keys(out);
+    let bumped = 0;
+    const targetBumped = Math.max(1, Math.floor(keys.length * 0.3));
+    for (const k of keys) {
+      if (bumped >= targetBumped) break;
+      if (Math.random() < 0.5) {
+        out[k] = (out[k] ?? 0) + 1;
+        bumped += 1;
+      }
+    }
+    // 兜底：若 random 运气太差一个都没改，强制改第 1 个 key
+    if (bumped === 0 && keys.length > 0) {
+      out[keys[0]] = (out[keys[0]] ?? 0) + 1;
+      bumped = 1;
+    }
+    // 再选 ~1/3 的已 bumped 部件再 +2（差异更大）
+    let boosted = 0;
+    const targetBoosted = Math.max(1, Math.floor(bumped / 3));
+    const bumpedKeys = keys.filter((k) => (out[k] ?? 0) > (input[k] ?? 0));
+    for (const k of bumpedKeys) {
+      if (boosted >= targetBoosted) break;
+      out[k] = (out[k] ?? 0) + 2;
+      boosted += 1;
+    }
+    return out;
+  };
+  const jitteredHeads = applyEvennessJitter(weights.heads);
+  const jitteredThoraxes = applyEvennessJitter(weights.thoraxes);
+  const jitteredAbdomens = applyEvennessJitter(weights.abdomens);
+  if (
+    jitteredHeads !== weights.heads ||
+    jitteredThoraxes !== weights.thoraxes ||
+    jitteredAbdomens !== weights.abdomens
+  ) {
+    console.warn(
+      '[DeepSeekAdvisor] 检测到 weights 过于均匀（死锁风险），已自动加微抖动',
+      {
+        heads: weights.heads,
+        thoraxes: weights.thoraxes,
+        abdomens: weights.abdomens,
+      },
+    );
+    weights.heads = jitteredHeads;
+    weights.thoraxes = jitteredThoraxes;
+    weights.abdomens = jitteredAbdomens;
   }
 
   // 硬约束兜底：LLM 选了 build_focus 但当前条件不允许
@@ -433,7 +564,100 @@ function validateDirective(
 
   const taunt = typeof obj.taunt === 'string' ? obj.taunt.slice(0, 80) : undefined;
 
-  return { mode: finalMode, weights, taunt };
+  // 科学家评语
+  const commentary = validateCommentary(obj.commentary);
+
+  // 科学家实验
+  const experiment = validateExperiment(obj.experiment, ctx);
+
+  return { mode: finalMode, weights, taunt, commentary, experiment };
+}
+
+/**
+ * 校验并清洗 commentary。
+ * - text 必须是 string，长度 ≤ 200
+ * - highlight 可选，长度 ≤ 80
+ * - 任何非法字段降级为 undefined（不影响其他字段）
+ */
+function validateCommentary(raw: unknown): ScientificCommentary | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const obj = raw as Record<string, unknown>;
+  const text = typeof obj.text === 'string' ? obj.text.trim() : '';
+  if (!text) return undefined;
+  const trimmedText = text.slice(0, 200);
+  const highlight = typeof obj.highlight === 'string'
+    ? obj.highlight.trim().slice(0, 80) || undefined
+    : undefined;
+  return { text: trimmedText, highlight };
+}
+
+/**
+ * 校验并清洗 experiment。
+ * - kind 必须在白名单；非法 → kind:'none'
+ * - durationMs / magnitude 强制夹在 EXPERIMENT_SPECS 范围内
+ * - side 必须 ∈ {'player','enemy','both'}；非法 → 'both'
+ * - purpose 截断 80 字符
+ * - 公平性：与上一实验间隔 < 60s 时强制 kind:'none'
+ */
+function validateExperiment(
+  raw: unknown,
+  context: AIBattleContext,
+): {
+  kind: ExperimentKind;
+  durationMs: number;
+  magnitude: number;
+  side: ExperimentSide;
+  purpose: string;
+} {
+  if (!raw || typeof raw !== 'object') {
+    return defaultExperiment();
+  }
+  const obj = raw as Record<string, unknown>;
+  const rawKind = obj.kind as ExperimentKind;
+  if (!VALID_EXPERIMENT_KINDS.includes(rawKind)) {
+    return { ...defaultExperiment(), purpose: 'kind 非法' };
+  }
+  const spec = EXPERIMENT_SPECS[rawKind];
+
+  // 'none' 直接返回默认（不查间隔，避免 kind:'none' 也被强制降级）
+  if (rawKind === 'none') {
+    const purpose = typeof obj.purpose === 'string' ? obj.purpose.slice(0, 80) : '本周期仅观察';
+    return { kind: 'none', durationMs: 0, magnitude: 1, side: 'both', purpose };
+  }
+
+  // 公平性：与上次实验间隔 < 60s → 强制 kind:'none'
+  if (context.lastExperiment) {
+    const gap = context.gameTime - context.lastExperiment.gameTime;
+    if (gap < 60_000) {
+      return {
+        ...defaultExperiment(),
+        purpose: `实验冷却中（剩余 ${Math.ceil((60_000 - gap) / 1000)}s）`,
+      };
+    }
+  }
+
+  // durationMs / magnitude 强制夹紧
+  const durRaw = Number(obj.durationMs);
+  const durationMs = Number.isFinite(durRaw)
+    ? Math.max(spec.durationRange[0], Math.min(spec.durationRange[1], Math.round(durRaw)))
+    : Math.round((spec.durationRange[0] + spec.durationRange[1]) / 2);
+
+  const magRaw = Number(obj.magnitude);
+  const magnitude = Number.isFinite(magRaw)
+    ? Math.max(spec.magnitudeRange[0], Math.min(spec.magnitudeRange[1], magRaw))
+    : (spec.magnitudeRange[0] + spec.magnitudeRange[1]) / 2;
+
+  const rawSide = obj.side as string;
+  const side: ExperimentSide =
+    rawSide === 'player' || rawSide === 'enemy' || rawSide === 'both'
+      ? rawSide
+      : 'both';
+
+  const purpose = typeof obj.purpose === 'string'
+    ? obj.purpose.slice(0, 80)
+    : '';
+
+  return { kind: rawKind, durationMs, magnitude, side, purpose };
 }
 
 /** 安全地从模型输出中提取 JSON（处理 ```json ... ``` 围栏） */
@@ -452,15 +676,37 @@ function parseJsonSafe(content: string): unknown {
   }
 }
 
-/** 默认指令：均匀权重 + iterate 模式 */
+/**
+ * 默认指令：iterate 模式 + 权重加随机抖动。
+ *
+ * 关键设计：
+ * - 旧版本用全 1 均匀权重 → 任意孵化室的 score 永远相等，
+ *   target.score === worst.score → scoreGap === 0，
+ *   AI 永远不会触发 demolish，只囤食物不花（死锁）。
+ * - 新版本给每个部件权重加 0~2 的随机偏移，确保 target 与 worst
+ *   之间长期有 scoreGap（>= 2 触发 demolish 的概率显著提升）。
+ * - 偏移量上限 2 是有意的：和 SCORE_GAP_THRESHOLD=2 对齐，
+ *   让一次 fallback 期间内基本能触发至少一次拆建。
+ */
 function fallbackDirective(ctx: AIBattleContext): StrategicDirective {
+  const jitter = (): number => Math.floor(Math.random() * 3); // 0, 1, or 2
+  const buildJitteredWeights = <K extends string>(
+    variants: readonly K[],
+  ): Partial<Record<K, number>> => {
+    const out: Partial<Record<K, number>> = {};
+    for (const v of variants) {
+      out[v] = jitter();
+    }
+    return out;
+  };
   return {
     mode: 'iterate',
     weights: {
-      heads: Object.fromEntries(ctx.availableHeads.map((h) => [h, 1])),
-      thoraxes: Object.fromEntries(ctx.availableThoraxes.map((t) => [t, 1])),
-      abdomens: Object.fromEntries(ctx.availableAbdomens.map((a) => [a, 1])),
+      heads: buildJitteredWeights(ctx.availableHeads),
+      thoraxes: buildJitteredWeights(ctx.availableThoraxes),
+      abdomens: buildJitteredWeights(ctx.availableAbdomens),
     },
+    experiment: defaultExperiment(),
   };
 }
 
@@ -487,7 +733,7 @@ export class DeepSeekStrategicAdvisor implements IStrategicAdvisor {
   private consecutiveFailures = 0;
 
   /** 当前 max_tokens（length 截断时自动翻倍，上限 4000） */
-  private currentMaxTokens = 800;
+  private currentMaxTokens = 600;
 
   constructor(opts: DeepSeekStrategicAdvisorOptions) {
     if (!opts.apiKey) throw new Error('[DeepSeekAdvisor] apiKey 不能为空');
@@ -641,7 +887,7 @@ export class DeepSeekStrategicAdvisor implements IStrategicAdvisor {
       // 成功：清零失败计数 + 复位 max_tokens 到默认
       this.consecutiveFailures = 0;
       this.cooldownUntil = 0;
-      this.currentMaxTokens = 800;
+      this.currentMaxTokens = 600;
       console.log(
         `[DeepSeekAdvisor] mode=${directive.mode}`,
         `taunt="${directive.taunt || ''}"`,
