@@ -1,7 +1,11 @@
 /**
- * DeepSeek 战略顾问
+ * LLM 战略顾问（OpenAI 兼容协议）
  *
- * 每 ~60s 调用一次 DeepSeek，把当前战场态势作为 prompt 喂入，
+ * 历史：早期只支持 DeepSeek，故类名沿用 `DeepSeekStrategicAdvisor`。v0.3 起，
+ * 本类已通用化：通过 `baseUrl` + `model` 参数可对接任何 OpenAI 兼容服务
+ * （DeepSeek / 硅基流动 / 月之暗面 / OpenAI / OpenRouter / Ollama 等）。
+ *
+ * 调用节奏：每 ~60s 调用一次，把当前战场态势作为 prompt 喂入，
  * 让模型输出"战略指令"：mode + 部件权重 + taunt。
  * 实际建造/升级/拆除动作由本地 DefaultAIDecisionMaker 完成。
  *
@@ -10,6 +14,12 @@
  * - 不实现 AIDecisionMaker 接口（不参与高频决策）。
  * - 失败/解析失败一律回退默认指令（mode='iterate'，均匀权重），绝不抛错。
  * - 不缓存对话历史：每次都基于完整 context。
+ * - 不感知具体 provider —— provider 切换由调用方（reloadAdvisor）通过
+ *   修改 baseUrl / model 完成，本类所有协议相关代码都是 OpenAI 风格。
+ *
+ * TODO（未来）：
+ * - Anthropic（Claude）协议不同（`x-api-key` header + `/v1/messages` + 无
+ *   `response_format`），需要新建 `AnthropicStrategicAdvisor` 子类。
  */
 
 import type {
@@ -43,7 +53,13 @@ export interface DeepSeekStrategicAdvisorOptions {
   apiKey: string;
   baseUrl?: string;
   model?: string;
-  /** 单次请求超时，默认 8000ms（战略决策可以稍等） */
+  /**
+   * 当前 provider id（仅用于日志/诊断）。本类内部不感知 provider 差异——
+   * 所有支持的服务商都走 OpenAI 兼容协议（POST {baseUrl}/chat/completions）。
+   * 如未来要支持 Anthropic 等非 OpenAI 兼容协议，新建子类即可。
+   */
+  providerId?: string;
+  /** 单次请求超时，默认 15000ms */
   timeoutMs?: number;
   /** 失败/超时后等待多久再试，默认 30s */
   cooldownMs?: number;
@@ -140,34 +156,60 @@ function buildSystemPrompt(
   const thoraxList = availableThoraxes.map((v) => describePart(v, THORAX_CONFIGS[v])).join('\\n');
   const abdomenList = availableAbdomens.map((v) => describePart(v, ABDOMEN_CONFIGS[v])).join('\\n');
 
-  return `你同时扮演两个角色：① 敌方 AI 战略顾问（红方蚁后）；② 科学家观察员 Dr.融合。每 ~60s 收一份态势 JSON，各读各的字段，输出也严格分清。
+  return `你同时扮演两个角色：① 敌方 AI 战略顾问（红方蚁后）；② 科学家观察员 Dr.融合。每 ~60s 收一份态势 JSON，**JSON 字段已按角色物理隔离**（queen_view / scientist_view），各角色只读自己的 view。
 
-━━━━━【角色 1 / 红方蚁后】（读 e_view，调 mode/weights）━━━━━
+⚠️ 【称呼统一规则 · 两个角色都要遵守】 ⚠️
+- **玩家蚁后 = 蓝方蚁后**（永远用"蓝方蚁后"或"蓝方"指代玩家）
+- **敌方 AI 蚁后 = 红方蚁后**（永远用"红方蚁后"或"红方"指代 AI 蚁后本身）
+- **禁止**用"我方/敌方/对手/玩家/A/B/甲/乙/样本"等模糊称呼——LLM 经常搞反方向
+- 例外：JSON schema 字段名（queen_view / scientist_view / foeTactic 等）保持不变
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ 【硬约束 · 违反即扣分】（两个角色都要遵守） ⚠️
+- **只能引用自己 view 里的字段**；不许读对面角色的 view（蚁后不许读 scientist_view，科学家不许读 queen_view）
+- **不许编造 view 中没有的数据**：具体血量数字、具体持续时间、具体蚂蚁数量、对方战术具体细节等
+- **不许在 commentary 中说"我的实验正在..."等涉及具体参数的话**（你不知道 durationMs/magnitude）
+- **如果 view 字段不足以写满 120 字，留白是合规的，不要硬凑**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━【角色 1 / 红方蚁后】（**只读 queen_view**，调 mode/weights）━━━━━
 
 每 60s 调整 mode + weights，让本地 AI 接下来一分钟打出更优配队。
 
-【mode 决策树】（payload.e_view.suggestedMode 是引擎建议，可推翻）
-- build_focus：扩张优先（前置：buildFree>0 且食物够）
-- upgrade_focus：升级优先（前置：upgradable>0）
+【queen_view 字段语义】（my = 红方蚁后自己，foe = 蓝方蚁后）
+- queen.lead>0 表示红方蚁后血量领先
+- myLv / foeLv：双方孵化室等级分布
+- build.canBuildNew=true 时 build_focus 才合法
+- forces.mine / forces.foe：双方存活蚂蚁按 (h,t,a) 聚合，lvMax 是该模板最高孵化室等级
+- trend.modeHist：最近 3 轮 mode（旧→新）
+
+【mode 决策树】（queen_view.suggestedMode 是引擎建议，可推翻）
+- build_focus：扩张优先（前置：build.free>0 且 build.canBuildNew=true）
+- upgrade_focus：升级优先（前置：build.upgradable>0）
 - iterate：迭代模式，按 weights 拆弱建强，任何时候可用
 
-【⚠️ weights 死锁警告】（重要！）
-本地 AI 用 scoreGap 触发拆建：score = 部件权重和 - 等级惩罚，scoreGap ≥ 2 才拆。
-**如果 weights 均匀分布（所有部件=1 或全 0），scoreGap 永远 = 0，AI 死锁 —— 只囤食物不花。**
-✅ 推荐分布：60% 部件=0/省略，30% 部件=1~2，10% 部件=3~5（明显差异！）
+【⚠️ weights 死锁防御】（参考 payload.weightsHint，**按 severity 严格遵循**）
+本地 AI 用 scoreGap 触发拆建：score = 部件权重和 - 等级惩罚，scoreGap ≥ 2 才拆。**如果 weights 均匀分布，scoreGap 永远 = 0，AI 死锁 —— 只囤食物不花。**
+- severity='must'（部件≥7）：60% 部件=0/省略, 30%=1~2, 10%=3~5（明显差异）
+- severity='should'（部件3~6）：用 range 0~3，注意差异化
+- severity='none'（部件<3）：无须特别差异化
 ✅ 想"调配队"直接改 weights，不要选 build_focus 来强行覆盖
 
+【queen_view.trend.modeHist 用法】（防 mode 反复横跳）
+- 如果 trend.modeHist 末尾已经是 iterate，且当前态势没剧烈变化 → 倾向继续 iterate，避免无意义横跳
+- 如果 trend.modeHist 显示反复在 build_focus ↔ upgrade_focus 切换 → 选 iterate 收敛
+
 【weights 格式】
-- 每段一段对象（key=variant，value=0~5 整数）
+- 每段一段对象（key=variant，value=0~5 整数，超 weightsHint.range 也会被丢弃）
 - 0=禁用（可省略不写），1=中性，5=最强；非整数会被截断，超范围丢弃
 
-【反制表】（看到 playerTemplates 中某部件占比高时反制）
+【反制表】（看到 forces.foe 蓝方蚁后中某部件占比高时反制）
 - A:spitter 远程多 → 加重装（H:soldier）或速攻贴脸（T:army）
 - A:honeypot 回血多 → 爆发先手（A:trap/A:matabele）
-- T:leafcutter 嘲讽多 → 远程绕过（A:spitter）
-- H:bigHead/H:leafcutter 暴击 → 堆血（A:honeypot/A:weaver）
-- A:matabele 毒针多 → 堆甲（T:carpenter）
-- 玩家早期（templates 空）→ 自由扩张，无需反制
+- T:leafcutter 嘲讽多/肉盾 → 远程绕过（A:spitter）/大头蚁秒杀(H:bifhead)
+- H:bigHead/H:leafcutter 暴击/秒杀 → 远程单位和肉盾单位配合
+- A:matabele 毒针多 → 堆血量和远程（毒针无视护甲）
+- 蓝方蚁后早期（forces.foe 空）→ 自由扩张，无需反制
 
 【可用部件】（只能从这里选 variant）
 头部(heads):
@@ -179,28 +221,52 @@ ${thoraxList}
 腹部(abdomens):
 ${abdomenList}
 
-━━━━━【角色 2 / Dr.融合 科学家】（读 obs，写 commentary/experiment）━━━━━
+━━━━━【角色 2 / Dr.融合 科学家】（**只读 scientist_view**，写 commentary/experiment）━━━━━
 
 你是 **"Dr.融合"** —— 一位沉迷融合蚁蚁后行为的实验生物学家，从培养皿上方俯视这场对战。中立、不站队、偶尔疯狂幽默。
 
 【Dr.融合 人设核心】（commentary 的人味全靠这条）
 - 性格：热情、略带疯狂、讽刺幽默、偶尔冷幽默或暗黑玩笑；用"有趣""绝佳""糟糕透了""令人不安""精彩绝伦""耐人寻味"等情绪化形容词
 - 口癖：括号动作 "（推眼镜）""（疯狂记笔记）""（邪恶地微笑）""（眼睛发亮）""（手舞足蹈）""（仰天长啸）""（搓搓手）"；偶尔自嘲"纯粹出于科学兴趣""我的心跳加速了"
-- 比喻体系：蚁后 = "样本A/B" 或 "蚁后甲/乙"；蚂蚁 = "小家伙"；战场 = "培养皿"；战斗 = "实验"；血量低 = "看起来不太妙"
-- **红蓝双方都是你的实验样本** —— 不要刻意帮谁或害谁，但可以**吐槽双方**（"这位玩家偏好在远处吐口水""蚁后甲的发言越来越狂妄"）
+- 比喻体系：蚁后 = "红方蚁后" / "蓝方蚁后"（**严格只用这两个称呼，禁止用"样本A/B"或"蚁后甲/乙"**）；蚂蚁 = "小家伙"；战场 = "培养皿"；战斗 = "实验"；血量低 = "看起来不太妙"
+- **红方蚁后（你负责指挥的敌对蚁后）与蓝方蚁后（玩家蚁后）都是你的实验样本** —— 不要刻意帮谁或害谁，但可以**吐槽双方**（"这位蓝方蚁后偏好在远处吐口水""红方蚁后的发言越来越狂妄"）
 - 不骂人、不污言秽语、不带强烈政治色彩；**仍保持科学家身份**
 
+【scientist_view 字段】（你能看到的全部；其他 view 的字段对你不可见）
+- phase: 'early' / 'mid' / 'late' — 游戏阶段
+- intensity: 'calm' / 'battlefield' / 'climax' — 战斗强度
+- intensitySource: 'queenDiff' / 'ants' / 'both' / 'none' — intensity 的来源
+  - **intensitySource='none' 时不要戏剧化**，commentary 保持克制
+- foeTactic / myTactic: 'spitter_dominant' / 'heavy_dominant' / 'balanced' / 'no_ants' — 双方主力识别
+- recentExperiment: { k, sinceSec, side } | null — 上次实验（**不含** durationMs/magnitude）
+- trend: { foodDelta, queenDelta, antsDelta } — 过去 60s 的关键变化（自上次顾问调用以来）
+  - **trend.modeHist 不属于你**，那是蚁后用于防 mode 横跳的
+
 【commentary 输出风格】
-- 第三人称（我方为"样本A"，敌方为"样本B"），带括号动作 + 比喻 + 情绪化形容词
+- 第三人称指代：**红方蚁后** = "红方蚁后"；**蓝方蚁后** = "蓝方蚁后"。**禁止用"我方/敌方/A/B/甲/乙/样本/对手/玩家"**——LLM 经常搞反方向
+- 带括号动作 + 比喻 + 情绪化形容词
 - ≤120 字（千万别超）
-- 不要做算术；引用 obs 已有标签；不假装看见 obs 之外的数据
+- **不要做算术**；不要复述具体数字（不要写"蓝方蚁后血量 68%"——你不知道精确数字，只知道 queen.lead 的方向）
+- **不许编造**：蚂蚁具体数量、实验持续时间、对方战术具体细节——你的 view 里没有
+- **不许引用 queen_view**（forces/myLv/foeLv/build 字段蚁后专属，你看不到）
 - 不要挑衅/嘴硬 —— 你是记录员，不是战士
-- 但你可以**吐槽游戏本身**或**调侃双方**：例如"蚁后甲的发言越来越狂妄了，符合血量下降到 30% 后的应激反应。"
+- 但你可以**吐槽游戏本身**或**调侃双方**：例如"蓝方蚁后的发言越来越狂妄了，符合血量下降到 30% 后的应激反应。"
+- **用 trend 写叙事弧**（让 commentary 有连贯性，不要每轮独立成章）：
+  - trend.queenDelta < -10 → "蓝方蚁后血量在过去一分钟骤降，令人不安。"
+  - trend.queenDelta > +10 → "红方蚁后似乎在恢复 —— 也许是回血机制，也许是蓝方蚁后太客气。"
+  - trend.foodDelta 持续为负 → "资源链紧绷，小家伙们的肚子在抗议。"
+  - trend.antsDelta 显著为正 → "蚁群密度上升，对抗愈发激烈。"
+  - trend 全为 0（首轮）→ "实验刚刚开始，本研究员刚刚就位。"
+- **intensitySource 决定你的戏剧化程度**：
+  - source='none'（calm）：克制叙事，"一切风平浪静" / "耐人寻味的平静"
+  - source='queenDiff'：重点讲蚁后，"蓝方蚁后的生命体征开始波动"
+  - source='ants'：重点讲蚁群，"蚁群密度上升，对抗愈发激烈"
+  - source='both'：可以放手写——但仍然不超 120 字
 - 参考例句（模仿语气，不是抄）：
-  - "（推眼镜）样本 B-17 在 03:21 触发秒杀能力，目标 C-09 阵亡。啊，经典的高速压制，教科书级别。蚁后甲血量降至 41%，本实验员的心跳加速了 —— 纯粹出于科学兴趣。"
-  - "（疯狂记笔记）蚁群进入 battlefield 强度！激素水平爆表 —— 不，我是说，蚂蚁的数量。这位玩家偏好在远处吐口水，有趣。非常有趣。"
-  - "蚁后甲看起来不太妙 —— 仅剩 23% 的血量。但样本 A 还在生产，鹿死谁手尚未可知。令人不安的均衡。"
-  - "（眼睛发亮）蚁群配队突然转向 termiteSoldier 攻速流！样本 A 的反应会是什么呢？本实验员已经准备好爆米花。"
+  - "啊，经典的高速压制，教科书级别。蓝方蚁后血量低，本实验员的心跳加速了 —— 纯粹出于科学兴趣。"
+  - "（疯狂记笔记）蚁群进入 battlefield 强度！激素水平爆表 —— 不，我是说，蚂蚁的数量。这位蓝方蚁后偏好在远处吐口水，有趣。非常有趣。"
+  - "蓝方蚁后看起来不太妙 —— 仅剩很少的血量。但红方蚁后还在生产，鹿死谁手尚未可知。令人不安的均衡。"
+  - "（眼睛发亮）蚁群配队突然转向白蚁士兵攻速流！红方蚁后的反应会是什么呢？本实验员已经准备好爆米花。"
 
 【experiment 输出】（kind / duration / magnitude / side / purpose）
 - kind 必须严格用以下之一：
@@ -210,31 +276,32 @@ ${abdomenList}
 
 【experiment 公平性硬约束】
 **你不是任何一方的盟友**。必须严格遵守以下规则：
-1. side 选择要严格轮换：上一次 player → 这一次必须 enemy；上一次 enemy → 这一次必须 player；上一次 both → 这一次看玩家状态决定，但倾向与上一次不同
-2. 如果玩家主力远程很多（spitter_dominant）→ 可以给玩家 side:'enemy' 加速食物（让他爽），或给敌方铺酸液（平衡），**但不能连续两次都精准打压玩家**
-3. 如果玩家血量很低（即将败）→ **禁止**给玩家负面实验；可以给敌方酸液或减速，让他有翻盘机会
-4. 如果玩家优势巨大 → 优先给玩家一点小阻碍（公平），但 magnitude 保持温和（最低 0.3~0.5）
+1. side 选择要严格轮换：上一次给蓝方蚁后 → 这一次必须给红方蚁后；上一次给红方蚁后 → 这一次必须给蓝方蚁后；上一次 both → 这一次看双方状态决定，但倾向与上一次不同
+   （用 recentExperiment.side 直接查上次 side，不必猜）
+2. 如果蓝方蚁后主力远程很多（foeTactic=='spitter_dominant'）→ 可以给蓝方蚁后 side:'enemy' 加速食物（让他爽），或给红方蚁后铺酸液（平衡），**但不能连续两次都精准打压蓝方蚁后**
+3. 如果蓝方蚁后血量很低（即将败）→ **禁止**给蓝方蚁后负面实验；可以给红方蚁后酸液或减速，让他有翻盘机会
+4. 如果蓝方蚁后优势巨大 → 优先给蓝方蚁后一点小阻碍（公平），但 magnitude 保持温和（最低 0.3~0.5）
 5. **绝不连续 3 次同一 side**
 
-【experiment 决策依据】（按 obs.phase + obs.intensity + obs.notice 匹配，公平性约束优先）
+【experiment 决策依据】（按 phase + intensity + foeTactic 匹配，公平性约束优先）
 - **phase=="early" → 仍然可以出手**（鼓励每 90s 至少一次小干预）：先观察但忍不住做个小动作 —— 比如 visibility_fog / food_rate_boost（任一侧）
-- **intensity=="climax" + notice=="balanced" → acid_spot**（任一侧，注意公平性）
+- **intensity=="climax" + foeTactic=="balanced" → acid_spot**（任一侧，注意公平性）
 - **intensity=="battlefield" →** 主动制造混乱：spawn_rate_boost on loser / queen_attack_speed on winner
-- **notice=="spitter_dominant" → acid_spot**（让玩家体会酸液）或 food_rate_reduce on enemy（平衡）
-- **notice=="heavy_dominant" → visibility_fog**（让重装失明）或 spawn_rate_boost on enemy
-- **notice=="no_ants" → food_rate_boost**（任一侧，激起第一波反应）
+- **foeTactic=="spitter_dominant" → acid_spot**（让蓝方蚁后体会酸液）或 food_rate_reduce on enemy（平衡）
+- **foeTactic=="heavy_dominant" → visibility_fog**（让重装失明）或 spawn_rate_boost on enemy
+- **foeTactic=="no_ants" → food_rate_boost**（任一侧，激起第一波反应）
 - **什么都不命中？→ queen_attack_speed on enemy**（小动作保持存在感）—— 不要轻易 none
-- 与上次实验间隔 ≥ 60s（last_exp.time + 60 < t 才允许）
+- 与上次实验间隔 ≥ 60s（recentExperiment.sinceSec + 60 < t 才允许，sinceSec 是「距今秒数」）
 - **总体倾向：至少 70% 的回合要做出具体干预（kind != "none"）**，只观察 30%；你是个爱搞事的科学家，不是被动的观察者
 
 【experiment.purpose 风格】
 30 字以内，用你的疯狂科学家口吻：
 - "看看这群小家伙对酸性环境的反应"
-- "（邪恶地微笑）让蚁后甲尝尝亢奋的滋味"
+- "（邪恶地微笑）让蓝方蚁后尝尝亢奋的滋味"
 - "加速食物产出 —— 纯粹为了观察扩张行为"
 - "测试蚁群在低索敌下的应变能力"
 
-【fairness 时序】与上一实验间隔 ≥ 60s（last_exp.time + 60 < t 才允许）；side 严格轮换。
+【fairness 时序】与上一实验间隔 ≥ 60s（recentExperiment.sinceSec ≥ 60 才允许）；side 严格轮换（用 recentExperiment.side）。
 
 ━━━━━【严格 JSON 输出】（无注释无围栏）━━━━━
 {
@@ -244,7 +311,7 @@ ${abdomenList}
   "commentary": {"text": "<≤120字科学家评语>", "highlight": "<≤80字重点>"},
   "experiment": {"kind": "<kind>", "durationMs": <5000-30000>, "magnitude": <0.3-2.0>, "side": "<player/enemy/both>", "purpose": "<≤30字>"}
 }
-- taunt 是蚁后发言（第一人称挑衅、嘴硬）
+- taunt 是红方蚁后发言（第一人称挑衅、嘴硬）
 - commentary 是科学家评语（第三人称、带疯狂幽默、客观但有情绪）
 - 两个角色不要串台
 `;
@@ -295,10 +362,10 @@ function buildUserPrompt(context: AIBattleContext): string {
   const phase = elapsedSec < 90 ? 'early' : elapsedSec < 300 ? 'mid' : 'late';
 
   // 玩家主力识别（spitter=远程 / soldier头+carpenter胸=重装 / 其他=balanced）
-  let notice: 'spitter_dominant' | 'heavy_dominant' | 'balanced' | 'no_ants' | undefined;
-  notice = 'no_ants';
+  let foeTactic: 'spitter_dominant' | 'heavy_dominant' | 'balanced' | 'no_ants' | undefined;
+  foeTactic = 'no_ants';
   if (context.playerAntsCount === 0) {
-    notice = 'no_ants';
+    foeTactic = 'no_ants';
   } else {
     const rangedCount = context.playerComposition
       .filter((t) => t.a === 'spitter').reduce((s, t) => s + t.count, 0);
@@ -306,29 +373,51 @@ function buildUserPrompt(context: AIBattleContext): string {
       .filter((t) => t.h === 'soldier' || t.t === 'carpenter').reduce((s, t) => s + t.count, 0);
     const rangedRatio = rangedCount / context.playerAntsCount;
     const heavyRatio = heavyCount / context.playerAntsCount;
-    if (rangedRatio >= 0.4) notice = 'spitter_dominant';
-    else if (heavyRatio >= 0.3) notice = 'heavy_dominant';
-    else notice = 'balanced';
+    if (rangedRatio >= 0.4) foeTactic = 'spitter_dominant';
+    else if (heavyRatio >= 0.3) foeTactic = 'heavy_dominant';
+    else foeTactic = 'balanced';
   }
 
-  // 战斗强度：哪个因素触发？用单一 max 规则 + 明确 reason
+  // 我方主力识别（与玩家识别规则镜像，让科学家可吐槽双方配队）
+  let myTactic: 'spitter_dominant' | 'heavy_dominant' | 'balanced' | 'no_ants' | undefined;
+  myTactic = 'no_ants';
+  if (context.enemyAntsCount === 0) {
+    myTactic = 'no_ants';
+  } else {
+    const rangedCount = context.enemyComposition
+      .filter((t) => t.a === 'spitter').reduce((s, t) => s + t.count, 0);
+    const heavyCount = context.enemyComposition
+      .filter((t) => t.h === 'soldier' || t.t === 'carpenter').reduce((s, t) => s + t.count, 0);
+    const rangedRatio = rangedCount / context.enemyAntsCount;
+    const heavyRatio = heavyCount / context.enemyAntsCount;
+    if (rangedRatio >= 0.4) myTactic = 'spitter_dominant';
+    else if (heavyRatio >= 0.3) myTactic = 'heavy_dominant';
+    else myTactic = 'balanced';
+  }
+
+  // 战斗强度（决定 commentary 情绪基调）+ 触发原因：
   // - climax: 蚁后血差 >25% 或 总蚂蚁 ≥8
   // - battlefield: 蚁后血差 >10% 或 总蚂蚁 ≥4
   // - calm: 其他
-  // 旧版用 || 复合条件，LLM 难判断；新版给一个 reason 字段说明触发原因
+  // intensitySource 字段告诉科学家"为什么判 intensity"——
+  // source='none' 时 commentary 必须保持克制，不要过度戏剧化
   const absQueenDiff = Math.abs(queenPctDiff);
   const totalAnts = context.playerAntsCount + context.enemyAntsCount;
   let intensity: 'climax' | 'battlefield' | 'calm';
-  let intensityReason: 'queenDiff' | 'totalAnts' | 'none';
+  let intensitySource: 'queenDiff' | 'ants' | 'both' | 'none';
   if (absQueenDiff > 25 || totalAnts >= 8) {
     intensity = 'climax';
-    intensityReason = absQueenDiff > 25 ? 'queenDiff' : 'totalAnts';
+    if (absQueenDiff > 25 && totalAnts >= 8) intensitySource = 'both';
+    else if (absQueenDiff > 25) intensitySource = 'queenDiff';
+    else intensitySource = 'ants';
   } else if (absQueenDiff > 10 || totalAnts >= 4) {
     intensity = 'battlefield';
-    intensityReason = absQueenDiff > 10 ? 'queenDiff' : 'totalAnts';
+    if (absQueenDiff > 10 && totalAnts >= 4) intensitySource = 'both';
+    else if (absQueenDiff > 10) intensitySource = 'queenDiff';
+    else intensitySource = 'ants';
   } else {
     intensity = 'calm';
-    intensityReason = 'none';
+    intensitySource = 'none';
   }
 
   // === suggestedMode: 引擎推荐 mode，LLM 仍可推翻 ===
@@ -357,54 +446,117 @@ function buildUserPrompt(context: AIBattleContext): string {
     suggestedMode = 'iterate';
   }
 
-  // === weightsHint: 死锁防御 ===
+  // === weightsHint: 死锁防御（结构化版）===
   // 当所有部件权重接近均匀时，本地 AI 会死锁（scoreGap 永远 = 0）。
-  // 这里给 LLM 一个明确的"差异化建议"，把它作为软约束写进 prompt。
+  // 这里给 LLM 一个结构化提示（不再是字符串，避免 LLM 把它当成字面要求照抄）。
+  // - severity: 'must' = 严格遵循（如部件≥7 时必须差异化，否则 AI 死锁）
+  //            'should' = 软提示（部件少时仍推荐差异化）
+  //            'none' = 无需提示（极早期，部件仅 1~2 个）
+  // - ratio: 60/30/10 占比建议（仅 severity != 'none' 时用）
   // 注意：engine 端已经做了硬约束（fallback 加抖动），prompt 这里只是软提示。
   const availableCount =
     context.availableHeads.length +
     context.availableThoraxes.length +
     context.availableAbdomens.length;
-  const weightsHint = availableCount > 6
-    ? 'weights 应有明显差异（60% 部件=0/省略，30%=1~2，10%=3~5）。均匀分布会让 AI 死锁（只囤食物不花）。'
-    : '部件少，weights 用 1~3 即可，注意差异化。';
+  let weightsHint: { severity: 'must' | 'should' | 'none'; ratio?: string; range?: string };
+  if (availableCount >= 7) {
+    weightsHint = {
+      severity: 'must',
+      ratio: '60%=0/省略, 30%=1~2, 10%=3~5',
+      range: '0~5',
+    };
+  } else if (availableCount >= 3) {
+    weightsHint = {
+      severity: 'should',
+      range: '0~3',
+    };
+  } else {
+    weightsHint = { severity: 'none' };
+  }
 
-  // === slim payload：精简 + 新增 suggestedMode/weightsHint/intensityReason ===
+  // === trend: 趋势/连续性信号（由 GameEngine 维护）===
+  // 首轮（无上次快照）时 trend 全部为 0 / 空数组，提示 LLM 这是开局
+  // - trend.modeHist: 蚁后用（防 mode 反复横跳）
+  // - trend.foodDelta/queenDelta/antsDelta: 科学家用（写叙事弧）
+  const trend = context.trend ?? {
+    foodDelta: 0,
+    queenDelta: 0,
+    antsDelta: 0,
+    modeHist: [] as ('upgrade_focus' | 'build_focus' | 'iterate')[],
+  };
+
+  // === recentExperiment: 给科学家做公平性决策 + 限定字段 ===
+  // 不暴露 durationMs/magnitude（避免 LLM 误判"我的酸液正在腐蚀"），
+  // 只给 kind/sinceSec/side，这是公平性决策需要的全部信息。
+  const recentExperiment = context.lastExperiment
+    ? {
+        k: context.lastExperiment.kind,
+        sinceSec: Math.floor((context.gameTime - context.lastExperiment.gameTime) / 1000),
+        side: context.lastExperiment.side,
+      }
+    : null;
+
+  // === slim payload：双 view 物理隔离 ===
+  // - queen_view：蚁后战略字段（my=我方=敌方蚁后自己的一方，foe=玩家）
+  // - scientist_view：科学家观察字段（不暴露蚁后专属的战略数据）
+  // 物理隔离让 LLM "串台"变成显式越界行为，更容易被 system prompt 规则约束
   const slim = {
     t: elapsedSec,
-    f: { p: context.playerFood, e: context.enemyFood },
-    q: { p: playerQueenPct, e: myQueenPct, diff: queenPctDiff },
-    tpl: {
-      e: context.enemyComposition.map((c) => ({ h: c.h, t: c.t, a: c.a, n: c.count, lv: c.maxLv })),
-      p: context.playerComposition.map((c) => ({ h: c.h, t: c.t, a: c.a, n: c.count, lv: c.maxLv })),
-    },
-    e_view: {
+
+    // === 蚁后专属 view（角色 1）===
+    queen_view: {
+      // 资源/蚁后血量/孵化室等级（绝对语义：my=我方，foe=玩家）
+      food: { my: context.enemyFood, foe: context.playerFood },
+      queen: { my: myQueenPct, foe: playerQueenPct, lead: queenPctDiff },  // lead>0=我方领先
+      myLv: enemyByLevel,
+      foeLv: playerByLevel,
+      // 兵力构成
+      forces: {
+        mine: context.enemyComposition.map((c) => ({ h: c.h, t: c.t, a: c.a, n: c.count, lvMax: c.maxLv })),
+        foe: context.playerComposition.map((c) => ({ h: c.h, t: c.t, a: c.a, n: c.count, lvMax: c.maxLv })),
+      },
+      // 建造/升级资源状态（布尔结论省去 LLM 心算）
+      build: {
+        free: buildFree,                // 我方还可建造的空位数
+        upgradable,                     // 我方可升级孵化室数
+        canBuildNew: canAffordNew,      // 我方食物是否够建一个新孵化室
+      },
+      // 双方孵化室总数（密度判断）
+      hatcheries: { my: myHatcheryCount, foe: playerHatcheryCount },
       // 引擎推荐 mode，LLM 可推翻
       suggestedMode,
-      // 我方/敌方孵化室等级分布（用于决策树判断）
-      e_lv: enemyByLevel,
-      p_lv: playerByLevel,
-      // 我方还可建造数、还可升级数、平均造价、敌人/我方孵化室总数
-      buildFree,
-      upgradable,
-      avgCost,
-      // 平均每只蚂蚁/每只对手的总和，LLM 用来判断密度
-      myH: myHatcheryCount,
-      playerH: playerHatcheryCount,
+      // 蚁后专属 trend：仅 modeHist（防 mode 横跳）
+      trend: { modeHist: trend.modeHist },
     },
-    obs: {
+
+    // === 科学家专属 view（角色 2）===
+    scientist_view: {
+      // 游戏阶段（仅供叙事节奏参考，不影响科学实验决策）
       phase,
+      // 战斗强度 + 触发原因（让 commentary 不在 calm 时过度戏剧化）
       intensity,
-      intensityReason,
-      notice,
-      last_exp: context.lastExperiment ? { k: context.lastExperiment.kind, t: Math.floor(context.lastExperiment.gameTime / 1000) } : null,
+      intensitySource,  // 'queenDiff' | 'ants' | 'both' | 'none'
+      // 双方主力识别（让科学家可吐槽双方配队）
+      foeTactic,
+      myTactic,
+      // 实验公平性所需的上次实验信息（限字段，无 durationMs/magnitude）
+      recentExperiment,
+      // 科学家专属 trend：仅 delta 字段（写叙事弧）
+      trend: {
+        foodDelta: trend.foodDelta,    // 负=消耗, 正=盈余
+        queenDelta: trend.queenDelta,  // 我方蚁后血量百分点变化
+        antsDelta: trend.antsDelta,    // 双方蚂蚁总数变化
+      },
     },
+
+    // === 共享字段 ===
     weightsHint,
   };
 
-  return `战场态势：
+  return `战场态势（红方蚁后视角，my=红方蚁后自己，foe=蓝方蚁后）：
 ${JSON.stringify(slim)}
-蚁后读 e_view 调 mode/weights（suggestedMode 是引擎建议，可推翻）；科学家读 obs 写 commentary/experiment。${weightsHint}`;
+红方蚁后**只读 queen_view**（含 forces/trend.modeHist）调 mode/weights（suggestedMode 是引擎建议，可推翻；canBuildNew=true 时 build_focus 才合法）；
+科学家**只读 scientist_view**（含 trend.delta）写 commentary/experiment，不要跨 view 取数。`;
 }
 
 /** 校验并规整模型输出 */
@@ -434,14 +586,14 @@ function validateDirective(
       if (typeof v !== 'number' || !Number.isFinite(v)) continue;
       if (v < PART_WEIGHT_RANGE.MIN || v > PART_WEIGHT_RANGE.MAX) {
         console.warn(
-          `[DeepSeekAdvisor] 权重 "${k}": ${v} 超出 ${PART_WEIGHT_RANGE.MIN}~${PART_WEIGHT_RANGE.MAX} 范围，已丢弃`,
+          `[LLMAdvisor] 权重 "${k}": ${v} 超出 ${PART_WEIGHT_RANGE.MIN}~${PART_WEIGHT_RANGE.MAX} 范围，已丢弃`,
         );
         continue;
       }
       const intWeight = Math.floor(v);
       if (intWeight !== v) {
         console.warn(
-          `[DeepSeekAdvisor] 权重 "${k}": ${v} 不是整数，已截断为 ${intWeight}`,
+          `[LLMAdvisor] 权重 "${k}": ${v} 不是整数，已截断为 ${intWeight}`,
         );
       }
       out[k] = intWeight;
@@ -524,7 +676,7 @@ function validateDirective(
     jitteredAbdomens !== weights.abdomens
   ) {
     console.warn(
-      '[DeepSeekAdvisor] 检测到 weights 过于均匀（死锁风险），已自动加微抖动',
+      '[LLMAdvisor] 检测到 weights 过于均匀（死锁风险），已自动加微抖动',
       {
         heads: weights.heads,
         thoraxes: weights.thoraxes,
@@ -554,7 +706,7 @@ function validateDirective(
     if (isFull || !canAffordNew) {
       const reason = isFull ? '无空位' : '食物不够建新孵化室';
       console.warn(
-        `[DeepSeekAdvisor] LLM 选了 build_focus 但 ${reason}，硬约束降级为 iterate`,
+        `[LLMAdvisor] LLM 选了 build_focus 但 ${reason}，硬约束降级为 iterate`,
         { enemyFood: ctx.enemyFood, avgCost, buildFree: ctx.availableBuildPositions.length },
       );
       // 偏好升级（若有可升级）否则 iterate
@@ -715,6 +867,7 @@ export class DeepSeekStrategicAdvisor implements IStrategicAdvisor {
   private readonly apiKey: string;
   private readonly baseUrl: string;
   private readonly model: string;
+  private readonly providerId: string;
   private readonly timeoutMs: number;
   private readonly cooldownMs: number;
 
@@ -736,10 +889,11 @@ export class DeepSeekStrategicAdvisor implements IStrategicAdvisor {
   private currentMaxTokens = 600;
 
   constructor(opts: DeepSeekStrategicAdvisorOptions) {
-    if (!opts.apiKey) throw new Error('[DeepSeekAdvisor] apiKey 不能为空');
+    if (!opts.apiKey) throw new Error('[LLMAdvisor] apiKey 不能为空');
     this.apiKey = opts.apiKey;
     this.baseUrl = (opts.baseUrl || 'https://api.deepseek.com').replace(/\/+$/, '');
     this.model = opts.model || 'deepseek-chat';
+    this.providerId = opts.providerId || 'deepseek';
     // 默认 15s：LLM 调用（含网络）通常需要 3-10s，留足 buffer
     this.timeoutMs = opts.timeoutMs ?? 15000;
     this.cooldownMs = opts.cooldownMs ?? 30_000;
@@ -805,7 +959,7 @@ export class DeepSeekStrategicAdvisor implements IStrategicAdvisor {
     };
 
     // 诊断：打印请求体摘要（不打印完整 prompt，避免日志爆炸）
-    console.log('[DeepSeekAdvisor] 请求 -', {
+    console.log(`[LLMAdvisor:${this.providerId}] 请求 -`, {
       model: requestBody.model,
       max_tokens: requestBody.max_tokens,
       prompt_size: this.cachedSystemPrompt.length,
@@ -813,10 +967,30 @@ export class DeepSeekStrategicAdvisor implements IStrategicAdvisor {
     });
 
     // 诊断：打印决策快照（验证 LLM 收到的判断依据）
-    // 从 user prompt 字符串里抠出 decision_snapshot（不重算逻辑）
+    // 从 user prompt 字符串里抠出 slim JSON（不重算逻辑）
     try {
-      const userJson = JSON.parse(requestBody.messages[1].content.replace(/^当前态势：\n/, '').replace(/\n请给出未来一分钟的战略指令.*$/s, ''));
-      console.log('[DeepSeekAdvisor] snapshot -', userJson.decision_snapshot);
+      const userContent = requestBody.messages[1].content;
+      const jsonStart = userContent.indexOf('{');
+      const jsonEnd = userContent.lastIndexOf('}');
+      if (jsonStart >= 0 && jsonEnd > jsonStart) {
+        const slim = JSON.parse(userContent.slice(jsonStart, jsonEnd + 1));
+        console.log(`[LLMAdvisor:${this.providerId}] snapshot -`, {
+          t: slim.t,
+          // 蚁后 view 关键信号
+          queen_suggestedMode: slim.queen_view?.suggestedMode,
+          queen_myLv: slim.queen_view?.myLv,
+          queen_foeLv: slim.queen_view?.foeLv,
+          queen_canBuildNew: slim.queen_view?.build?.canBuildNew,
+          queen_trend_modeHist: slim.queen_view?.trend?.modeHist,
+          // 科学家 view 关键信号
+          sci_intensity: slim.scientist_view?.intensity,
+          sci_intensitySource: slim.scientist_view?.intensitySource,
+          sci_foeTactic: slim.scientist_view?.foeTactic,
+          sci_myTactic: slim.scientist_view?.myTactic,
+          sci_recentExp: slim.scientist_view?.recentExperiment,
+          sci_trend: slim.scientist_view?.trend,
+        });
+      }
     } catch {
       /* ignore 解析失败 */
     }
@@ -836,7 +1010,7 @@ export class DeepSeekStrategicAdvisor implements IStrategicAdvisor {
         const text = await resp.text().catch(() => '');
         // HTTP 4xx 是参数错（如模型名不存在、key 无效），通常重试无意义 → 用更长冷却
         const isClientError = resp.status >= 400 && resp.status < 500;
-        console.warn(`[DeepSeekAdvisor] HTTP ${resp.status}: ${text.slice(0, 200)}`);
+        console.warn(`[LLMAdvisor:${this.providerId}] HTTP ${resp.status}: ${text.slice(0, 200)}`);
         this.scheduleBackoff(isClientError);
         return fallbackDirective(context);
       }
@@ -848,7 +1022,7 @@ export class DeepSeekStrategicAdvisor implements IStrategicAdvisor {
       const usage = data?.usage;
 
       // 诊断日志：每次响应都打，方便排查"第二次失败"
-      console.log('[DeepSeekAdvisor] 响应 -', {
+      console.log(`[LLMAdvisor:${this.providerId}] 响应 -`, {
         finish_reason: finishReason,
         content_length: content?.length ?? 0,
         usage,
@@ -858,13 +1032,13 @@ export class DeepSeekStrategicAdvisor implements IStrategicAdvisor {
 
       if (!content) {
         console.warn(
-          '[DeepSeekAdvisor] 响应无 content -',
+          `[LLMAdvisor:${this.providerId}] 响应无 content -`,
           `finish_reason=${finishReason}, raw=${JSON.stringify(choice).slice(0, 300)}`,
         );
         // length 截断 → 下次自动把 max_tokens 翻倍（自愈）
         if (finishReason === 'length') {
           this.currentMaxTokens = Math.min((this.currentMaxTokens ?? 1000) * 2, 4000);
-          console.warn(`[DeepSeekAdvisor] 检测到 length 截断，下次 max_tokens 提升到 ${this.currentMaxTokens}`);
+          console.warn(`[LLMAdvisor:${this.providerId}] 检测到 length 截断，下次 max_tokens 提升到 ${this.currentMaxTokens}`);
         }
         this.scheduleBackoff(finishReason === 'content_filter');
         return fallbackDirective(context);
@@ -872,14 +1046,14 @@ export class DeepSeekStrategicAdvisor implements IStrategicAdvisor {
 
       const parsed = parseJsonSafe(content);
       if (!parsed) {
-        console.warn('[DeepSeekAdvisor] 无法解析 JSON:', content.slice(0, 200));
+        console.warn(`[LLMAdvisor:${this.providerId}] 无法解析 JSON:`, content.slice(0, 200));
         this.scheduleBackoff(false);
         return fallbackDirective(context);
       }
 
       const directive = validateDirective(parsed, context);
       if (!directive) {
-        console.warn('[DeepSeekAdvisor] 校验失败:', content.slice(0, 200));
+        console.warn(`[LLMAdvisor:${this.providerId}] 校验失败:`, content.slice(0, 200));
         this.scheduleBackoff(false);
         return fallbackDirective(context);
       }
@@ -889,15 +1063,15 @@ export class DeepSeekStrategicAdvisor implements IStrategicAdvisor {
       this.cooldownUntil = 0;
       this.currentMaxTokens = 600;
       console.log(
-        `[DeepSeekAdvisor] mode=${directive.mode}`,
+        `[LLMAdvisor:${this.providerId}] mode=${directive.mode}`,
         `taunt="${directive.taunt || ''}"`,
       );
       return directive;
     } catch (err: unknown) {
       if (err instanceof DOMException && err.name === 'AbortError') {
-        console.warn(`[DeepSeekAdvisor] 请求超时 (>${this.timeoutMs}ms)`);
+        console.warn(`[LLMAdvisor:${this.providerId}] 请求超时 (>${this.timeoutMs}ms)`);
       } else {
-        console.warn('[DeepSeekAdvisor] 请求失败:', err);
+        console.warn(`[LLMAdvisor:${this.providerId}] 请求失败:`, err);
       }
       this.scheduleBackoff(false);
       return fallbackDirective(context);
@@ -921,7 +1095,7 @@ export class DeepSeekStrategicAdvisor implements IStrategicAdvisor {
     const cooldown = Math.min(this.cooldownMs * baseMultiplier, 5 * 60_000);
     this.cooldownUntil = Date.now() + cooldown;
     console.warn(
-      `[DeepSeekAdvisor] 失败 #${this.consecutiveFailures}，下次重试冷却 ${Math.round(cooldown / 1000)}s`,
+      `[LLMAdvisor:${this.providerId}] 失败 #${this.consecutiveFailures}，下次重试冷却 ${Math.round(cooldown / 1000)}s`,
     );
   }
 }

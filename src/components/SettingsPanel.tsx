@@ -1,7 +1,8 @@
 /**
  * 设置面板（顶部触发按钮 + 模态弹窗 + 顶部提示横幅）
  *
- * 主要功能：让玩家输入 DeepSeek API Key 来启用 LLM 战略顾问。
+ * v0.3 改造：让用户选择 AI 服务商（DeepSeek / 硅基流动 / OpenAI / Ollama / 自定义 等），
+ * 而不再被 DeepSeek 硬编码。
  *
  * 本地运行安全设计：
  * - 输入框默认 type="password"，可点 👁 切换显示
@@ -13,14 +14,19 @@
  * 用户必须在 UI 中显式输入。详见 llmKeyStore.ts。
  *
  * 视觉层次（从最显眼的入口到最细节）：
- * 1. APIKeyHint 横幅 — 未配置时顶部醒目黄色 CTA，已配置时紧凑绿色徽章
- * 2. 左上角 SettingsPanel — 带文字标签（"AI 已启用"/"AI 未启用"）和状态点
- * 3. SettingsModal — 完整配置 UI
+ * 1. APIKeyHint 横幅 — 未配置时顶部醒目黄色 CTA，已配置时紧凑绿色徽章（带服务商名）
+ * 2. 左上角 SettingsPanel — 带文字标签（"AI · DeepSeek"/"AI 未启用"）和状态点
+ * 3. SettingsModal — 完整配置 UI（服务商 + baseUrl + model + apiKey）
  */
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { llmKeyStore, maskKey } from '../store/llmKeyStore';
 import { reloadAdvisor } from '../hooks/usePixiApp';
+import {
+  LLM_PROVIDERS,
+  type LLMProvider,
+  resolveProviderConfig,
+} from '../ai/providers';
 
 type TestState =
   | { kind: 'idle' }
@@ -28,27 +34,31 @@ type TestState =
   | { kind: 'ok' }
   | { kind: 'fail'; message: string };
 
-/** 共用的"当前 LLM 状态" hook */
+/** 共用的"当前 LLM 状态" hook（v0.3） */
 function useLLMStatus() {
   // 已移除 env 自动加载：VITE_DEEPSEEK_API_KEY 会被打包进前端 bundle 暴露给所有访问者。
   // 因此只跟踪运行时 key（在 UI 中由用户输入）。
   const [hasRuntimeKey, setHasRuntimeKey] = useState<boolean>(!!llmKeyStore.getKey());
+  const [hasAnyKey, setHasAnyKey] = useState<boolean>(llmKeyStore.hasAnyKey());
+  const [activeProvider, setActiveProvider] = useState<LLMProvider>(llmKeyStore.getActiveProvider());
 
   useEffect(() => {
     const refresh = () => {
       setHasRuntimeKey(!!llmKeyStore.getKey());
+      setHasAnyKey(llmKeyStore.hasAnyKey());
+      setActiveProvider(llmKeyStore.getActiveProvider());
     };
     refresh();
     return llmKeyStore.subscribe(refresh);
   }, []);
 
-  return { hasRuntimeKey, hasAnyKey: hasRuntimeKey };
+  return { hasRuntimeKey, hasAnyKey, activeProvider };
 }
 
 // ===== 顶部提示横幅 =====
 // 未配置时显示醒目黄色 CTA，已配置时显示紧凑绿色徽章
 export const APIKeyHint: React.FC = () => {
-  const { hasAnyKey } = useLLMStatus();
+  const { hasAnyKey, activeProvider } = useLLMStatus();
   const [open, setOpen] = useState(false);
 
   if (hasAnyKey) {
@@ -63,7 +73,7 @@ export const APIKeyHint: React.FC = () => {
             <span className="absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75 animate-ping" />
             <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500" />
           </span>
-          <span className="text-green-300">🤖 AI 战略顾问：已启用</span>
+          <span className="text-green-300">🤖 AI 战略顾问：已启用 · {activeProvider.name}</span>
           <span className="text-green-500/70 group-hover:text-green-300 transition-colors">
             点击管理 →
           </span>
@@ -79,7 +89,7 @@ export const APIKeyHint: React.FC = () => {
         onClick={() => setOpen(true)}
         className="w-full cursor-pointer bg-gradient-to-r from-yellow-600/40 via-amber-500/40 to-yellow-600/40 border-b-2 border-yellow-400/70 px-4 py-2.5 flex items-center justify-center gap-3 hover:from-yellow-600/60 hover:via-amber-500/60 hover:to-yellow-600/60 transition-all"
         role="button"
-        title="点击填写 DeepSeek API Key 启用 LLM 战略顾问"
+        title="点击选择 AI 服务商并填写 API Key 启用 LLM 战略顾问"
       >
         <span className="text-2xl animate-bounce">🤖</span>
         <div className="flex flex-col items-start">
@@ -87,11 +97,11 @@ export const APIKeyHint: React.FC = () => {
             启用 AI 战略顾问，让你的对手更聪明！
           </span>
           <span className="text-yellow-300/70 text-xs">
-            需要 DeepSeek API Key（在 UI 输入，仅存内存，不写入任何文件）
+            支持 DeepSeek / 硅基流动 / OpenAI / Ollama / 自定义 等（仅存内存，不写入任何文件）
           </span>
         </div>
         <span className="ml-4 px-4 py-1.5 bg-yellow-400 text-yellow-900 font-game font-bold text-sm rounded shadow-lg hover:bg-yellow-300 transition-colors">
-          🔑 立即配置 API Key
+          选择并启用 →
         </span>
       </div>
       <SettingsModal open={open} onClose={() => setOpen(false)} />
@@ -101,23 +111,69 @@ export const APIKeyHint: React.FC = () => {
 
 // ===== 模态弹窗（hooks + handlers）=====
 const SettingsModal: React.FC<{ open: boolean; onClose: () => void }> = ({ open, onClose }) => {
+  const [providerId, setProviderId] = useState<string>(llmKeyStore.getActiveProviderId());
+  const [baseUrl, setBaseUrl] = useState<string>('');
+  const [model, setModel] = useState<string>('');
   const [input, setInput] = useState('');
   const [showKey, setShowKey] = useState(false);
   const { hasRuntimeKey } = useLLMStatus();
   const [testState, setTestState] = useState<TestState>({ kind: 'idle' });
   const pendingKeyRef = useRef<string | null>(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // 当 provider 切换时，重新载入当前 provider 已有的 userConfig（baseUrl/model 覆盖）
+  useEffect(() => {
+    const provider = LLM_PROVIDERS.find((p) => p.id === providerId) ?? LLM_PROVIDERS[0];
+    const userCfg = llmKeyStore.getConfig(providerId);
+    if (userCfg) {
+      setBaseUrl(userCfg.baseUrl || '');
+      setModel(userCfg.model || '');
+    } else {
+      setBaseUrl(provider.defaultBaseUrl || '');
+      setModel(provider.defaultModel || '');
+    }
+  }, [providerId, open]);
+
+  // 切换 provider 时弹确认
+  const requestProviderChange = useCallback(
+    (nextId: string) => {
+      if (nextId === providerId) return;
+      const cur = llmKeyStore.getActiveProviderId();
+      const curHasKey = llmKeyStore.hasKey(cur);
+      const nextHasKey = llmKeyStore.hasKey(nextId);
+      if (curHasKey && cur !== nextId && !nextHasKey) {
+        const ok = window.confirm(
+          `切换到「${LLM_PROVIDERS.find((p) => p.id === nextId)?.name}」后，需要重新填写该服务商的 API Key。\n确定继续？`,
+        );
+        if (!ok) return;
+      }
+      setProviderId(nextId);
+      setTestState({ kind: 'idle' });
+    },
+    [providerId],
+  );
 
   const handleSave = useCallback(async () => {
     const key = input.trim();
     if (!key) return;
     pendingKeyRef.current = key;
-    llmKeyStore.setKey(key);
+    if (llmKeyStore.getActiveProviderId() !== providerId) {
+      llmKeyStore.setActiveProviderId(providerId);
+    }
+    llmKeyStore.setKey(key, providerId);
+    const finalProvider = LLM_PROVIDERS.find((p) => p.id === providerId) ?? LLM_PROVIDERS[0];
+    const overrides: { baseUrl?: string; model?: string } = {};
+    const trimmedBase = baseUrl.trim().replace(/\/+$/, '');
+    const trimmedModel = model.trim();
+    if (trimmedBase && trimmedBase !== finalProvider.defaultBaseUrl) overrides.baseUrl = trimmedBase;
+    if (trimmedModel && trimmedModel !== finalProvider.defaultModel) overrides.model = trimmedModel;
+    llmKeyStore.setConfig(overrides, providerId);
     setInput('');
     setShowKey(false);
     onClose();
     setTestState({ kind: 'idle' });
     await reloadAdvisor();
-  }, [input, onClose]);
+  }, [input, providerId, baseUrl, model, onClose]);
 
   const handleTest = useCallback(async () => {
     const key = input.trim() || pendingKeyRef.current;
@@ -125,24 +181,32 @@ const SettingsModal: React.FC<{ open: boolean; onClose: () => void }> = ({ open,
       setTestState({ kind: 'fail', message: '请先输入 API Key' });
       return;
     }
+    const finalProvider = LLM_PROVIDERS.find((p) => p.id === providerId) ?? LLM_PROVIDERS[0];
+    const { baseUrl: resolvedBase } = resolveProviderConfig(
+      finalProvider,
+      { baseUrl: baseUrl, model: model },
+    );
+    const resolvedModel = model.trim() || finalProvider.defaultModel;
+    if (!resolvedBase) {
+      setTestState({ kind: 'fail', message: 'Base URL 不能为空（Custom 模式需要自填）' });
+      return;
+    }
+    if (!resolvedModel) {
+      setTestState({ kind: 'fail', message: 'Model 不能为空（Custom 模式需要自填）' });
+      return;
+    }
     setTestState({ kind: 'testing' });
     try {
-      const baseUrl =
-        (import.meta.env.VITE_DEEPSEEK_BASE_URL as string | undefined) ||
-        'https://api.deepseek.com';
-      const model =
-        (import.meta.env.VITE_DEEPSEEK_MODEL as string | undefined) ||
-        'deepseek-chat';
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 10_000);
-      const resp = await fetch(`${baseUrl}/chat/completions`, {
+      const resp = await fetch(`${resolvedBase}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${key}`,
         },
         body: JSON.stringify({
-          model,
+          model: resolvedModel,
           messages: [{ role: 'user', content: 'ping' }],
           max_tokens: 4,
           stream: false,
@@ -165,18 +229,21 @@ const SettingsModal: React.FC<{ open: boolean; onClose: () => void }> = ({ open,
         setTestState({ kind: 'fail', message: String((err as Error)?.message || err) });
       }
     }
-  }, [input]);
+  }, [input, providerId, baseUrl, model]);
 
   const handleClearRuntime = useCallback(async () => {
-    llmKeyStore.clearKey();
+    llmKeyStore.clearKey(providerId);
     pendingKeyRef.current = null;
     setTestState({ kind: 'idle' });
     await reloadAdvisor();
-  }, []);
+  }, [providerId]);
 
-  const statusLabel = hasRuntimeKey ? '运行时 Key（生效中）' : '未配置';
+  const currentProvider = LLM_PROVIDERS.find((p) => p.id === providerId) ?? LLM_PROVIDERS[0];
+  const isCustom = currentProvider.id === 'custom';
 
   if (!open) return null;
+
+  const statusLabel = hasRuntimeKey ? '运行时 Key（生效中）' : '未配置';
 
   return (
     <div
@@ -184,7 +251,7 @@ const SettingsModal: React.FC<{ open: boolean; onClose: () => void }> = ({ open,
       onClick={onClose}
     >
       <div
-        className="bg-gray-900 border border-gray-700 rounded-lg p-6 w-full max-w-md shadow-2xl"
+        className="bg-gray-900 border border-gray-700 rounded-lg p-6 w-full max-w-md shadow-2xl max-h-[90vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-4">
@@ -195,18 +262,92 @@ const SettingsModal: React.FC<{ open: boolean; onClose: () => void }> = ({ open,
         <div className="mb-4 p-3 rounded bg-gray-800/50 border border-gray-700">
           <div className="text-xs text-gray-400 mb-1">当前状态</div>
           <div className={`text-sm font-game ${statusLabel === '未配置' ? 'text-gray-400' : 'text-green-400'}`}>
-            {statusLabel}
+            {statusLabel}{hasRuntimeKey && ` · ${llmKeyStore.getActiveProvider().name}`}
           </div>
         </div>
 
-        <label className="block text-sm text-gray-300 mb-2 font-game">DeepSeek API Key</label>
+        {/* 服务商选择 */}
+        <label className="block text-sm text-gray-300 mb-2 font-game">AI 服务商</label>
+        <select
+          value={providerId}
+          onChange={(e) => requestProviderChange(e.target.value)}
+          className="w-full px-3 py-2 rounded bg-gray-800 border border-gray-600 text-white text-sm focus:outline-none focus:border-yellow-500"
+        >
+          {LLM_PROVIDERS.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name} — {p.note}
+            </option>
+          ))}
+        </select>
+
+        {/* 模型选择 */}
+        <label className="block text-sm text-gray-300 mt-3 mb-2 font-game">模型</label>
+        {currentProvider.modelCandidates.length > 0 ? (
+          <div className="flex gap-2">
+            <input
+              type="text"
+              list={`models-${currentProvider.id}`}
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              placeholder={currentProvider.defaultModel}
+              autoComplete="off"
+              spellCheck={false}
+              className="flex-1 px-3 py-2 rounded bg-gray-800 border border-gray-600 text-white text-sm font-mono focus:outline-none focus:border-yellow-500"
+            />
+            <datalist id={`models-${currentProvider.id}`}>
+              {currentProvider.modelCandidates.map((m) => (
+                <option key={m} value={m} />
+              ))}
+            </datalist>
+          </div>
+        ) : (
+          <input
+            type="text"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            placeholder="例如 gpt-4o-mini"
+            autoComplete="off"
+            spellCheck={false}
+            className="w-full px-3 py-2 rounded bg-gray-800 border border-gray-600 text-white text-sm font-mono focus:outline-none focus:border-yellow-500"
+          />
+        )}
+        <p className="mt-1 text-[11px] text-gray-500">留空则使用 {currentProvider.defaultModel || '默认模型'}</p>
+
+        {/* 高级：Base URL */}
+        <button
+          onClick={() => setShowAdvanced((v) => !v)}
+          className="mt-3 text-xs text-gray-400 hover:text-gray-200"
+          type="button"
+        >
+          {showAdvanced ? '▼' : '▶'} 高级（自定义 Base URL）
+        </button>
+        {showAdvanced && (
+          <div className="mt-2">
+            <label className="block text-xs text-gray-400 mb-1">Base URL</label>
+            <input
+              type="text"
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              placeholder={currentProvider.defaultBaseUrl || 'https://your-endpoint/v1'}
+              autoComplete="off"
+              spellCheck={false}
+              className="w-full px-3 py-2 rounded bg-gray-800 border border-gray-600 text-white text-xs font-mono focus:outline-none focus:border-yellow-500"
+            />
+            <p className="mt-1 text-[11px] text-gray-500">默认：{currentProvider.defaultBaseUrl || '(空，需自填)'}</p>
+          </div>
+        )}
+
+        {/* API Key */}
+        <label className="block text-sm text-gray-300 mt-4 mb-2 font-game">
+          API Key {isCustom && <span className="text-[11px] text-gray-500">（任意字符串）</span>}
+        </label>
         <div className="relative">
           <input
             type={showKey ? 'text' : 'password'}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter' && input.trim()) void handleSave(); }}
-            placeholder="sk-..."
+            placeholder={currentProvider.keyHint}
             autoComplete="off"
             spellCheck={false}
             className="w-full px-3 py-2 pr-10 rounded bg-gray-800 border border-gray-600 text-white text-sm font-mono focus:outline-none focus:border-yellow-500"
@@ -215,6 +356,11 @@ const SettingsModal: React.FC<{ open: boolean; onClose: () => void }> = ({ open,
             {showKey ? '🙈' : '👁'}
           </button>
         </div>
+        {llmKeyStore.getKey(providerId) && (
+          <p className="mt-1 text-[11px] text-green-400">
+            当前 Key：{maskKey(llmKeyStore.getKey(providerId))}
+          </p>
+        )}
 
         {testState.kind !== 'idle' && (
           <div className={`mt-2 text-xs px-2 py-1 rounded ${
@@ -230,11 +376,11 @@ const SettingsModal: React.FC<{ open: boolean; onClose: () => void }> = ({ open,
 
         <div className="flex items-center gap-2 mt-4">
           <button onClick={handleSave} disabled={!input.trim()} className="flex-1 px-4 py-2 rounded text-sm font-game bg-yellow-500/30 text-yellow-300 border border-yellow-500/50 hover:bg-yellow-500/50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">💾 保存并启用</button>
-          <button onClick={handleTest} disabled={!input.trim() && !pendingKeyRef.current} className="px-4 py-2 rounded text-sm font-game bg-blue-500/30 text-blue-300 border border-blue-500/50 hover:bg-blue-500/50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors" title="用当前输入的 Key 发起一次最小请求验证有效性">🧪 测试</button>
+          <button onClick={handleTest} disabled={!input.trim() && !pendingKeyRef.current} className="px-4 py-2 rounded text-sm font-game bg-blue-500/30 text-blue-300 border border-blue-500/50 hover:bg-blue-500/50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors" title="用当前输入的 Key + Base URL + Model 发起一次最小请求验证有效性">🧪 测试</button>
         </div>
 
         {hasRuntimeKey && (
-          <button onClick={handleClearRuntime} className="w-full mt-2 px-4 py-2 rounded text-sm font-game bg-red-500/20 text-red-300 border border-red-500/40 hover:bg-red-500/40 transition-colors">🗑 清除运行时 Key（完全关闭 LLM）</button>
+          <button onClick={handleClearRuntime} className="w-full mt-2 px-4 py-2 rounded text-sm font-game bg-red-500/20 text-red-300 border border-red-500/40 hover:bg-red-500/40 transition-colors">🗑 清除「{currentProvider.name}」的 Key（完全关闭 LLM）</button>
         )}
 
         <div className="mt-4 p-3 rounded bg-yellow-900/20 border border-yellow-700/30 text-xs text-yellow-200/80 leading-relaxed">
@@ -247,10 +393,10 @@ const SettingsModal: React.FC<{ open: boolean; onClose: () => void }> = ({ open,
   );
 };
 
-// ===== 左上角入口按钮（升级版：带文字标签 + 状态点 + "配置" 徽章）=====
+// ===== 左上角入口按钮（带文字标签 + 状态点 + "配置" 徽章）=====
 export const SettingsPanel: React.FC = () => {
   const [open, setOpen] = useState(false);
-  const { hasAnyKey, hasRuntimeKey } = useLLMStatus();
+  const { hasAnyKey, hasRuntimeKey, activeProvider } = useLLMStatus();
 
   return (
     <>
@@ -261,7 +407,7 @@ export const SettingsPanel: React.FC = () => {
             ? 'bg-green-500/20 text-green-300 border-green-500/50 hover:bg-green-500/30'
             : 'bg-yellow-500/30 text-yellow-200 border-yellow-500/60 hover:bg-yellow-500/50 shadow-md shadow-yellow-500/20'
         }`}
-        title={hasAnyKey ? '管理 LLM 战略顾问（已启用）' : '配置 API Key 启用 AI 战略顾问'}
+        title={hasAnyKey ? `管理 LLM 战略顾问（${activeProvider.name} · 已启用）` : '配置 AI 服务商启用 LLM 战略顾问'}
       >
         <span className="relative inline-flex h-2 w-2">
           {hasAnyKey && (
@@ -269,7 +415,9 @@ export const SettingsPanel: React.FC = () => {
           )}
           <span className={`relative inline-flex rounded-full h-2 w-2 ${hasAnyKey ? 'bg-green-400' : 'bg-yellow-400'}`} />
         </span>
-        <span className="font-bold">{hasAnyKey ? '🤖 AI 已启用' : '🧠 AI 未启用'}</span>
+        <span className="font-bold">
+          {hasAnyKey ? `🤖 AI · ${activeProvider.vendor}` : '🧠 AI 未启用'}
+        </span>
         {hasRuntimeKey && (
           <span className="text-[10px] text-amber-300 ml-0.5" title="运行时 Key（保存在内存中）">Ⓡ</span>
         )}

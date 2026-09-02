@@ -114,6 +114,23 @@ export interface AIBattleContext {
     purpose: string;
     side: import('../config/experiments').ExperimentSide;
   };
+
+  /**
+   * 趋势/连续性信号（由 GameEngine 维护，每 ~60s 在 advisor 调用前填充）
+   * 让 LLM 拿到的是「已聚合好的信号」而不是 60s 滚动历史——
+   * 既保证 Dr.融合 commentary 有叙事弧，又不污染 messages 历史。
+   * 字段可选：首轮调用时无上次快照，trend 全部为 0 或空数组。
+   */
+  trend?: {
+    /** 过去 60s 敌方食物变化（负=消耗，正=产出超过消耗） */
+    foodDelta: number;
+    /** 过去 60s 敌方蚁后血量变化（负=挨打，正=回血）；整数百分点 */
+    queenDelta: number;
+    /** 过去 60s 双方蚂蚁总数变化 */
+    antsDelta: number;
+    /** 最近 3 轮 LLM 选的 mode（含本轮，旧的在前）；用于防 mode 反复横跳 */
+    modeHist: ('upgrade_focus' | 'build_focus' | 'iterate')[];
+  };
 }
 
 /**
@@ -849,6 +866,24 @@ export class GameEngine {
   /** 顾问触发间隔（游戏时间，ms）。60 游戏秒 = 1x 速 60s，3x 速 20s 真实秒 */
   private static readonly ADVISOR_INTERVAL_MS = 60_000;
 
+  /**
+   * Trend 历史快照：每次 LLM 调用成功时存一份关键指标，下一轮用于计算 delta。
+   * 让 LLM 拿到的是「已聚合的 trend 字段」（~40 tok）
+   * 而不是把整段对话历史塞回 messages（~350 tok 且会漂移）。
+   *
+   * 注意：delta 严格对应"两次 LLM 调用之间的间隔"——offline experimenter
+   * 不写这个字段，所以下次 trend 计算的是「自上次 LLM 决策以来的累计变化」，
+   * 语义最清晰（防 LLM 困惑"为什么 trend 跨度这么大"）。
+   */
+  private lastAdvisorSnapshot: {
+    gameTime: number;
+    enemyFood: number;
+    enemyQueenPct: number;
+    totalAnts: number;
+  } | null = null;
+  /** 最近 3 轮 LLM 选的 mode（旧→新）。首轮为 [当前 mode] */
+  private modeHistory: AIMode[] = [];
+
   /** 离线实验器（没配 key 或 LLM 失败时兜底；只产出 experiment，不输出 commentary/taunt） */
   private offlineExperimenter: OfflineScientist | null = null;
   /** 上次调用离线实验器时的游戏时间（ms） */
@@ -966,6 +1001,35 @@ export class GameEngine {
     const enemyComposition = computeComposition(state.ants, state.hatcheries, 'enemy');
     const playerComposition = computeComposition(state.ants, state.hatcheries, 'player');
 
+    // === trend：基于 lastAdvisorSnapshot 计算过去 60s 的变化 ===
+    // 首轮调用（lastAdvisorSnapshot 为 null）时全部为 0 / 空数组，让 LLM 知道这是开局。
+    const totalAnts =
+      state.ants.filter(a => a.side === 'enemy' && a.state !== 'dead').length +
+      state.ants.filter(a => a.side === 'player' && a.state !== 'dead').length;
+    const enemyQueenPct =
+      state.enemyQueen.maxHp > 0
+        ? Math.round((state.enemyQueen.hp / state.enemyQueen.maxHp) * 100)
+        : 0;
+
+    let trend: AIBattleContext['trend'];
+    if (this.lastAdvisorSnapshot) {
+      const snap = this.lastAdvisorSnapshot;
+      trend = {
+        foodDelta: state.enemyFood - snap.enemyFood,
+        queenDelta: enemyQueenPct - snap.enemyQueenPct,
+        antsDelta: totalAnts - snap.totalAnts,
+        // 历史 mode 不含本轮（LLM 还没选）
+        modeHist: [...this.modeHistory],
+      };
+    } else {
+      trend = {
+        foodDelta: 0,
+        queenDelta: 0,
+        antsDelta: 0,
+        modeHist: [],
+      };
+    }
+
     return {
       enemyFood: state.enemyFood,
       playerFood: state.playerFood,
@@ -988,6 +1052,8 @@ export class GameEngine {
       availableAbdomens: state.enemyUnlockedParts.abdomens,
       // 上次实验（用于 LLM 避免重复干预）
       lastExperiment: state.lastExperiment ?? undefined,
+      // 趋势/连续性信号（用于 LLM 写叙事弧、防 mode 横跳）
+      trend,
     };
   }
 
@@ -1106,6 +1172,9 @@ export class GameEngine {
     this.lastUnlockGameTime = 0;
     // 重置战略顾问计时器（新一局让顾问能尽快首次执行）
     this.lastAdvisorGameTime = 0;
+    // 重置 trend 历史（新一局让顾问从「无趋势」开始）
+    this.lastAdvisorSnapshot = null;
+    this.modeHistory = [];
     // 重置离线实验器
     this.lastOfflineExperimentGameTime = 0;
     if (this.offlineExperimenter) {
@@ -1853,6 +1922,28 @@ export class GameEngine {
           `[StrategicAdvisor] mode=${directive.mode} taunt="${directive.taunt || ''}" ` +
             `experiment=${directive.experiment?.kind ?? 'none'}`,
         );
+
+        // === 维护 trend 历史快照 ===
+        // 在 directive.then 的最后做：此时 directive.mode 已经被写入 defaultAI，
+        // 重新读 store 拿到最新 enemyFood/queenHp/totalAnts 存为「上次快照」，
+        // 用于下一轮 trend.delta 计算。
+        // 注意：要重新读 store，不能复用 ctx，因为 directive 落地期间 store 可能已被更新。
+        const afterState = useGameStore.getState();
+        const afterQueenPct =
+          afterState.enemyQueen.maxHp > 0
+            ? Math.round((afterState.enemyQueen.hp / afterState.enemyQueen.maxHp) * 100)
+            : 0;
+        const afterTotalAnts =
+          afterState.ants.filter((a) => a.side === 'enemy' && a.state !== 'dead').length +
+          afterState.ants.filter((a) => a.side === 'player' && a.state !== 'dead').length;
+        this.lastAdvisorSnapshot = {
+          gameTime: afterState.stats.gameTime,
+          enemyFood: afterState.enemyFood,
+          enemyQueenPct: afterQueenPct,
+          totalAnts: afterTotalAnts,
+        };
+        // modeHistory 滑动窗口：最多保留最近 3 轮
+        this.modeHistory = [...this.modeHistory, directive.mode].slice(-3);
       })
       .catch((err) => {
         console.warn('[StrategicAdvisor] advise 失败:', err);

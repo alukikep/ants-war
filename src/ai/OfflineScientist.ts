@@ -35,7 +35,7 @@ const PURPOSES: Record<ExperimentKind, string[]> = {
   food_rate_boost: [
     '看看这群小家伙资源充足时的扩张反应',
     '（疯狂记笔记）加速食物产出 —— 纯粹为了观察蚁群经济行为',
-    '蚁后甲最近吃得有点少，给她加餐',
+    '红方蚁后最近吃得有点少，给她加餐',
     '食物注入实验 —— 我赌这会让蚁群扩张速度翻倍',
   ],
   food_rate_reduce: [
