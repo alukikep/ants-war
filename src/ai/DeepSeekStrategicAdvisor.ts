@@ -69,27 +69,133 @@ const VALID_MODES: AIMode[] = ['upgrade_focus', 'build_focus', 'iterate'];
 
 /**
  * 描述部件（prompt 用）—— 紧凑单行格式：
- *   <槽>:<variant>(<中文名>) 价<cost> <stat1> ... <能力标签...>
+ *   <槽>:<variant>(<中文名>) 价<cost> <属性:五档>... [<能力标签>...] [<定位标签>...]
  *
  * 槽位前缀：H=头, T=胸, A=腹
  *
- * 能力标签约定（用于快速让 LLM 识别机制）：
- *   远攻+N          远程伤害加成（木蚁腹）
- *   血-N%           远程生命惩罚
- *   甲+N            固定护甲（carpenter 胸）
- *   crit1:X/2:Y/3:Z 暴击按等级
- *   逃:回血% <40%血  大齿猛蚁逃脱
- *   光环:加攻速 至300% 衰减20%/s   白蚁大兵头
- *   秒:X/Y/Z        大头蚁秒杀几率按等级
- *   嘲:<20%血 +30%hp +80%甲5s     切叶蚁胸嘲讽
- *   肾:首次受敌 +攻/甲            子弹蚁胸肾上腺素
- *   死爆:+50hp回血 半径80         蜜罐蚁腹
- *   毒针:减攻速50%+毒40/60/100    马塔贝勒蚁腹（CD 5s）
- *   慢2:20%/3:40%                木蚁腹减速按等级
+ * 属性段（4 个基础属性，0 加成则省略该字段）：
+ *   攻击:低 / 中低 / 中 / 中高 / 高
+ *   生命:低 / 中低 / 中 / 中高 / 高
+ *   速度:低 / 中低 / 中 / 中高 / 高
+ *   攻速:低 / 中低 / 中 / 中高 / 高
+ *
+ * 能力标签约定（去掉强度数字，只留触发条件 + 效果语义）：
+ *   [暴击:按等级]                H:leafcutter
+ *   [重装]                       H:soldier
+ *   [双生:同格可容纳2只]         H:fire
+ *   [逃脱:低血时弹射回血]        H:odontomachus
+ *   [光环:加攻速(衰减)]          H:termiteSoldier
+ *   [秒杀:低几率]                H:bigHead
+ *   [固定护甲]                   T:carpenter
+ *   [嘲讽:低血时强制敌人攻击]    T:leafcutter
+ *   [肾上腺素:首次受敌时强化]    T:bullet
+ *   [远攻]                       A:spitter
+ *   [减速:命中后]                A:spitter
+ *   [死爆:死亡时回血友军]        A:honeypot
+ *   [毒针:减攻速+中毒]           A:matabele
+ *   [均衡]                       A:weaver
+ *   [爆发:攻+攻速]               A:trap
+ *
+ * 定位标签段（最多 2 个，描述部件角色定位）：
+ *   脆    自身血量极低（spitter）
+ *   肉    高血/有护甲
+ *   爆发  短时高输出
+ *   续航  回复/循环
+ *   功能  纯机制无属性
+ *   速攻  纯速度型
  *
  * 例：
- *   H:leafcutter(切叶蚁头) 价80 攻+20 crit1:5/2:10/3:15
- *   A:honeypot(蜜罐蚁腹) 价70 血+40 速-15 死爆:+50hp回血 半径80
+ *   H:leafcutter(切叶蚁头) 价80 攻击:中高 [暴击:按等级]
+ *   A:honeypot(蜜罐蚁腹)   价70 生命:中 [死爆:死亡时回血友军] 续航
+ *   A:spitter(木蚁腹)      价80 攻击:中高 速度:低 [远攻][减速:命中后] 脆 功能
+ */
+/**
+ * 把部件 stats 中的数值映射为五档定性分级。
+ *
+ * 阈值（绝对值）适用于 攻击/生命/速度/攻速 四个字段：
+ *   低    攻击 1~5 / 生命 1~15 / 速度 1~10 / 攻速 1~5%
+ *   中低  攻击 6~14 / 生命 16~30 / 速度 11~25 / 攻速 6~10%
+ *   中    攻击 15~19 / 生命 31~50 / 速度 26~35 / 攻速 11~15%
+ *   中高  攻击 20~24 / 生命 51~70 / 速度 36~50 / 攻速 16~25%
+ *   高    攻击 ≥25 / 生命 ≥71 / 速度 ≥51 / 攻速 ≥26%
+ *
+ * 负值语义：生命/速度/攻速的负值是负面惩罚（如 spitter 生命 -80）。
+ * 为避免 LLM 误读"负值绝对值大 = 高"，**负数加 `-` 后缀**：
+ *   攻击 -25 → "高-"（减攻高）
+ *   生命 -80 → "高-"（脆得离谱）
+ *   速度 -15 → "低-"（轻微减速）
+ *
+ * 阈值依据当前 HEAD/THORAX/ABDOMEN_CONFIGS 的真实分布手动拍板（仅 ≤6 个非 basic 部件，
+ * 不适合统计分位）；目标是 LLM 跨部件比较时拿到的是**相对等级**而非绝对数字。
+ */
+function toTier(n: number, axis: 'attack' | 'hp' | 'speed' | 'attackSpeed'): string | null {
+  if (n === 0) return null; // 0 加成 → 字段省略
+  const abs = Math.abs(n);
+  const neg = n < 0;
+  let tier: string;
+  switch (axis) {
+    case 'attack':
+      if (abs <= 5) tier = '低';
+      else if (abs <= 14) tier = '中低';
+      else if (abs <= 19) tier = '中';
+      else if (abs <= 24) tier = '中高';
+      else tier = '高';
+      break;
+    case 'hp':
+      if (abs <= 15) tier = '低';
+      else if (abs <= 30) tier = '中低';
+      else if (abs <= 50) tier = '中';
+      else if (abs <= 70) tier = '中高';
+      else tier = '高';
+      break;
+    case 'speed':
+      if (abs <= 10) tier = '低';
+      else if (abs <= 25) tier = '中低';
+      else if (abs <= 35) tier = '中';
+      else if (abs <= 50) tier = '中高';
+      else tier = '高';
+      break;
+    case 'attackSpeed':
+      if (abs <= 5) tier = '低';
+      else if (abs <= 10) tier = '中低';
+      else if (abs <= 15) tier = '中';
+      else if (abs <= 25) tier = '中高';
+      else tier = '高';
+      break;
+  }
+  return neg ? `${tier}-` : tier;
+}
+
+/**
+ * 描述部件（prompt 用）—— 紧凑单行格式：
+ *   <槽>:<variant>(<中文名>) 价<cost> <属性:五档>... [<能力标签>...] [<定位标签>...]
+ *
+ * 槽位前缀：H=头, T=胸, A=腹
+ *
+ * 能力标签段（去掉强度数字，只留触发条件 + 效果语义）：
+ *   [暴击:按等级]                H:leafcutter
+ *   [重装]                       H:soldier
+ *   [双生:同格可容纳2只]         H:fire
+ *   [逃脱:低血时弹射回血]        H:odontomachus
+ *   [光环:加攻速(衰减)]          H:termiteSoldier
+ *   [秒杀:低几率]                H:bigHead
+ *   [固定护甲]                   T:carpenter
+ *   [嘲讽:低血时强制敌人攻击]    T:leafcutter
+ *   [肾上腺素:首次受敌时强化]    T:bullet
+ *   [远攻]                       A:spitter
+ *   [减速:命中后]                A:spitter
+ *   [死爆:死亡时回血友军]        A:honeypot
+ *   [毒针:减攻速+中毒]           A:matabele
+ *   [均衡]                       A:weaver
+ *   [爆发:攻+攻速]               A:trap
+ *
+ * 定位标签段（最多 2 个，描述部件角色定位）：
+ *   脆    自身血量极低（spitter）
+ *   肉    高血/有护甲
+ *   爆发  短时高输出
+ *   续航  回复/循环
+ *   功能  纯机制无属性
+ *   速攻  纯速度型
  */
 function describePart(
   variant: HeadVariant | ThoraxVariant | AbdomenVariant,
@@ -99,52 +205,94 @@ function describePart(
   const type = config.type;
   const slotPrefix = type === 'head' ? 'H' : type === 'thorax' ? 'T' : 'A';
 
-  const stats: string[] = [];
-  if (s.damage) stats.push(`攻${signed(s.damage)}`);
-  if (s.hp) stats.push(`血${signed(s.hp)}`);
-  if (s.speed) stats.push(`速${signed(s.speed)}`);
-  if (s.attackSpeed) stats.push(`攻速${signed(s.attackSpeed)}%`);
+  // === 属性段（5 档） ===
+  const statLabels: Record<string, string> = {
+    damage: '攻击',
+    hp: '生命',
+    speed: '速度',
+    attackSpeed: '攻速',
+  };
+  const axisMap: Record<string, 'attack' | 'hp' | 'speed' | 'attackSpeed'> = {
+    damage: 'attack',
+    hp: 'hp',
+    speed: 'speed',
+    attackSpeed: 'attackSpeed',
+  };
+  const statParts: string[] = [];
+  for (const key of ['damage', 'hp', 'speed', 'attackSpeed'] as const) {
+    const tier = toTier(s[key] ?? 0, axisMap[key]);
+    if (tier) statParts.push(`${statLabels[key]}:${tier}`);
+  }
 
+  // === 能力标签段（无强度数字，仅触发/效果） ===
   const tags: string[] = [];
 
   // ---- 头部能力 ----
   if (type === 'head') {
-    if (variant === 'leafcutter') tags.push('crit1:5/2:10/3:15');
-    if (variant === 'fire') tags.push('双生:同格+1只');
-    if (variant === 'odontomachus') tags.push('逃:回血50% <40%血 10s cd');
-    if (variant === 'termiteSoldier') tags.push('光环:加攻速 至300% 衰减20%/s');
-    if (variant === 'bigHead') tags.push('秒:3/5/8');
-    if (variant === 'soldier') tags.push('重装:高攻慢速');
+    if (variant === 'leafcutter') tags.push('[暴击:按等级]');
+    if (variant === 'fire') tags.push('[双生:同格可容纳2只]');
+    if (variant === 'odontomachus') tags.push('[逃脱:低血时弹射回血]');
+    if (variant === 'termiteSoldier') tags.push('[光环:加攻速(衰减)]');
+    if (variant === 'bigHead') tags.push('[秒杀:低几率]');
+    if (variant === 'soldier') tags.push('[重装]');
   }
 
   // ---- 胸部能力 ----
   if (type === 'thorax') {
-    if (variant === 'carpenter' && s.flatArmor) tags.push(`甲+${s.flatArmor}`);
-    if (variant === 'leafcutter') tags.push('嘲:<20%血 +30%hp +80%甲5s 15s cd');
-    if (variant === 'bullet') tags.push('肾:首次受敌 +攻/甲 5/8/12s 60s cd');
+    if (variant === 'carpenter' && s.flatArmor) tags.push('[固定护甲]');
+    if (variant === 'leafcutter') tags.push('[嘲讽:低血时强制敌人攻击]');
+    if (variant === 'bullet') tags.push('[肾上腺素:首次受敌时强化]');
   }
 
   // ---- 腹部能力 ----
   if (type === 'abdomen') {
     if (variant === 'spitter') {
-      tags.push('远攻+25');
-      tags.push('血-30%');
-      tags.push('慢2:20/3:40');
+      tags.push('[远攻]');
+      tags.push('[减速:命中后]');
     }
-    if (variant === 'honeypot') tags.push('死爆:+50hp回血 半径80');
-    if (variant === 'matabele') tags.push('毒针5s cd:减攻速50%+毒40/60/100');
-    if (variant === 'weaver') tags.push('均衡:血/速/攻速');
-    if (variant === 'trap') tags.push('爆发:攻+攻速');
+    if (variant === 'honeypot') tags.push('[死爆:死亡时回血友军]');
+    if (variant === 'matabele') tags.push('[毒针:减攻速+中毒]');
+    if (variant === 'weaver') tags.push('[均衡]');
+    if (variant === 'trap') tags.push('[爆发:攻+攻速]');
   }
 
-  const statStr = stats.length ? stats.join(' ') : '无加成';
-  const tagStr = tags.length ? ' ' + tags.join(' ') : '';
-  return `${slotPrefix}:${variant}(${config.nameCN}) 价${config.cost} ${statStr}${tagStr}`;
-}
+  // === 定位标签段（最多 2 个） ===
+  const positions: string[] = [];
+  // 头部
+  if (type === 'head') {
+    if (variant === 'basic') {
+      /* 无 */
+    } else if (variant === 'soldier') positions.push('重装');
+    else if (variant === 'bigHead') positions.push('爆发');
+    else if (variant === 'odontomachus') positions.push('续航');
+    else if (variant === 'termiteSoldier') positions.push('功能');
+    else if (variant === 'fire') positions.push('功能');
+    // leafcutter: 无定位（纯数值型部件）
+  }
+  // 胸部
+  if (type === 'thorax') {
+    if (variant === 'basic') {
+      /* 无 */
+    } else if (variant === 'army') positions.push('速攻');
+    else if (variant === 'carpenter') positions.push('肉');
+    else if (variant === 'bullet') positions.push('速攻');
+    else if (variant === 'leafcutter') positions.push('肉', '功能');
+  }
+  // 腹部
+  if (type === 'abdomen') {
+    if (variant === 'basic') {
+      /* 无 */
+    } else if (variant === 'spitter') positions.push('脆', '功能');
+    else if (variant === 'honeypot') positions.push('续航');
+    else if (variant === 'weaver') positions.push('肉');
+    else if (variant === 'trap') positions.push('爆发');
+    else if (variant === 'matabele') positions.push('肉');
+  }
 
-/** 数字带符号（+12 / -5） */
-function signed(n: number): string {
-  return `${n > 0 ? '+' : ''}${n}`;
+  const statStr = statParts.length ? statParts.join(' ') : '';
+  const tagStr = tags.length ? ' ' + tags.join(' ') : '';
+  const posStr = positions.length ? ' ' + positions.join(' ') : '';
+  return `${slotPrefix}:${variant}(${config.nameCN}) 价${config.cost} ${statStr}${tagStr}${posStr}`.trimEnd();
 }
 
 function buildSystemPrompt(
@@ -163,6 +311,20 @@ function buildSystemPrompt(
 - **敌方 AI 蚁后 = 红方蚁后**（永远用"红方蚁后"或"红方"指代 AI 蚁后本身）
 - **禁止**用"我方/敌方/对手/玩家/A/B/甲/乙/样本"等模糊称呼——LLM 经常搞反方向
 - 例外：JSON schema 字段名（queen_view / scientist_view / foeTactic 等）保持不变
+
+⚠️ 【档位后缀语义 · 必读】 ⚠️
+部件描述中的属性字段格式是「属性名:档位」，档位取值：
+- 五档（从弱到强）：低 < 中低 < 中 < 中高 < 高
+- 加「-」后缀表示**负面属性（属性被削减）**，与字母分级（A-/B+）无关：
+  - 「生命:高-」= 该部件生命**被大幅削减**（脆得离谱，例：A:spitter 生命 -80）
+  - 「速度:低-」= 该部件**轻微减速**（例：A:honeypot 速度 -15）
+  - 「攻击:高-」= 攻击力被削减（虽然当前配置中暂无此例）
+- 判断规则：**只看「-」后缀有无**，再读档位高低：
+  - 「生命:高」= 正向高血（肉盾）
+  - 「生命:高-」= 负向高惩罚（脆）
+  - 「生命:低」= 正向低血（几乎无加成）
+  - 「生命:低-」= 负向低惩罚（轻微扣血）
+- 反制策略中看到「生命:高-」等带「-」后缀的部件 → **避免堆它**，应当反制该脆部件
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ⚠️ 【硬约束 · 违反即扣分】（两个角色都要遵守） ⚠️
@@ -203,12 +365,12 @@ function buildSystemPrompt(
 - 每段一段对象（key=variant，value=0~5 整数，超 weightsHint.range 也会被丢弃）
 - 0=禁用（可省略不写），1=中性，5=最强；非整数会被截断，超范围丢弃
 
-【反制表】（看到 forces.foe 蓝方蚁后中某部件占比高时反制）
-- A:spitter 远程多 → 加重装（H:soldier）或速攻贴脸（T:army）
-- A:honeypot 回血多 → 爆发先手（A:trap/A:matabele）
-- T:leafcutter 嘲讽多/肉盾 → 远程绕过（A:spitter）/大头蚁秒杀(H:bifhead)
-- H:bigHead/H:leafcutter 暴击/秒杀 → 远程单位和肉盾单位配合
-- A:matabele 毒针多 → 堆血量和远程（毒针无视护甲）
+【反制表】（看到 forces.foe 蓝方蚁后中某定位标签部件占比高时反制，措辞与上方部件描述对齐）
+- [远攻]（A:spitter）多 → 加 [重装]（H:soldier）或 [速攻]（T:army/T:bullet）贴脸
+- [续航]/[死爆]（A:honeypot）多 → [爆发] 先手（A:trap）或 [毒针]（A:matabele）先手
+- [嘲讽] 或 [肉]（T:leafcutter、T:carpenter、A:weaver、A:matabele）多 → [远攻] 绕过 或 [秒杀]（H:bigHead）终结
+- [暴击]（H:leafcutter）/[秒杀]（H:bigHead）多 → 配 [远攻] + [肉] 形成攻防组合
+- [毒针]（A:matabele）多 → 堆 [生命:中高以上] + [远攻]（毒无视护甲）
 - 蓝方蚁后早期（forces.foe 空）→ 自由扩张，无需反制
 
 【可用部件】（只能从这里选 variant）

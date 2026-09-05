@@ -13,13 +13,43 @@ import { ExperimentBanner } from './components/ExperimentBanner';
 import { SoundControl } from './components/SoundControl';
 import { SettingsPanel, APIKeyHint } from './components/SettingsPanel';
 import { soundManager } from './utils/SoundManager';
+import { useGameStore } from './store/gameStore';
+
+/**
+ * 背景音乐状态联动组件（不渲染任何 UI）。
+ *
+ * 监听 gameStore.status 的变化：
+ *   - 'playing' → 播放/恢复背景音乐
+ *   - 'paused'  → 暂停背景音乐（断点保留，恢复游戏可继续播放）
+ *   - 其他状态（idle / victory / defeat） → 停止音乐
+ *
+ * 为什么不放在 usePixiApp 里：usePixiApp 生命周期较长且依赖 PixiApplication；
+ * 独立组件可避免与游戏画布渲染耦合，也方便后续替换状态机。
+ */
+const MusicController: React.FC = () => {
+  const status = useGameStore((state) => state.status);
+
+  useEffect(() => {
+    if (status === 'playing') {
+      soundManager.playMusic();
+    } else if (status === 'paused') {
+      soundManager.pauseMusic();
+    } else {
+      // idle / victory / defeat：彻底停止
+      soundManager.stopMusic();
+    }
+  }, [status]);
+
+  return null;
+};
 
 const App: React.FC = () => {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
-  
-  // 初始化音效系统
+
+  // 初始化音效系统（SFX + BGM）
   useEffect(() => {
     soundManager.init();
+    soundManager.initMusic();
     return () => {
       soundManager.destroy();
     };
@@ -46,11 +76,14 @@ const App: React.FC = () => {
   }, []);
 
   return (
-    <div 
+    <div
       ref={scrollContainerRef}
       className="h-screen bg-bio-dark flex flex-col relative overflow-y-auto"
       style={{ scrollBehavior: 'smooth' }}
     >
+      {/* 背景音乐状态联动（无渲染输出） */}
+      <MusicController />
+
       {/* 音效控制 - 绝对定位在左上角 */}
       <div className="absolute top-16 left-4 z-50 flex items-center gap-2">
         <SoundControl />

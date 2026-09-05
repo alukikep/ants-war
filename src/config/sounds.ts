@@ -1,9 +1,18 @@
 /**
  * 音效配置
  * 定义游戏中的各种音效
+ *
+ * 注意：音乐路径 `music.battle` 默认指向 `public/music/battle.mp3`。
+ * 由开发者/用户自行将 .mp3 / .ogg / .wav 文件放入该目录。
+ * 如果想支持多格式兜底，可以将路径改为数组形式：
+ *   battle: ['/music/battle.mp3', '/music/battle.ogg']
  */
 
 export const SOUNDS = {
+    // 背景音乐（战斗时循环播放）
+    music: {
+        battle: '/music/battle.mp3',
+    },
     // 攻击音效
     attack: {
         melee: '/sounds/attack_melee.wav',      // 近战攻击

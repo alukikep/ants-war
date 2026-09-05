@@ -366,7 +366,10 @@ export const useGameStore = create<GameStore>((set, get) => ({
       hasTauntAbility,
       tauntCooldown: 0,
       baseArmor: 0, // 切叶蚁胸不再有基础护甲，护甲效果通过技能触发
-      flatArmor: baseStats.flatArmor || 0, // 木蚁胸固定护甲
+      // 木蚁胸固定护甲按孵化室等级：1级+5 / 2级+8 / 3级+12
+      flatArmor: template.thorax === 'carpenter'
+        ? (hatchery.level === 1 ? 5 : hatchery.level === 2 ? 8 : 12)
+        : (baseStats.flatArmor || 0),
       // 蜜罐蚁腹死亡爆炸回复
       hasHoneypotExplosion,
       // 大头蚁头部秒杀能力

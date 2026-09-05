@@ -1,6 +1,11 @@
 /**
  * 音效管理器
  * 使用 Howler.js 管理游戏音效
+ *
+ * 包含两部分：
+ *  - SFX：通过 `sounds` Map 管理，每个音效独立冷却
+ *  - BGM：单实例循环（loop=true），独立音量，独立开关
+ *    走 `pause()` / `play()` 实现暂停游戏时断点继续
  */
 
 import { Howl, Howler } from 'howler';
@@ -17,8 +22,17 @@ class SoundManager {
     private enabled: boolean = true;
     private initialized: boolean = false;
 
+    // === BGM（背景音乐）独立状态 ===
+    // 注意：音量/开关独立于 SFX，避免主音量滑块影响音乐（详见 README/架构说明）
+    private music: Howl | null = null;
+    private musicEnabled: boolean = true;
+    private musicVolume: number = SOUND_VOLUMES.music; // 默认 0.5
+    private musicInitialized: boolean = false;
+    // 标记是否处于"暂停态"（howl.pause 后用 play() 即可从断点继续）
+    private musicPaused: boolean = false;
+
     constructor() {
-        // 设置主音量
+        // 设置主音量（仅作用于 SFX，详见 setMasterVolume / setMusicVolume）
         Howler.volume(SOUND_VOLUMES.master);
     }
 
@@ -51,6 +65,39 @@ class SoundManager {
 
         this.initialized = true;
         console.log('[SoundManager] 音效系统初始化完成');
+    }
+
+    /**
+     * 初始化背景音乐（仅创建 Howl 实例，不自动播放）
+     * 必须在用户有过交互（点过"开始游戏"）后才能成功 play()
+     */
+    initMusic() {
+        if (this.musicInitialized) return;
+        if (!SOUNDS.music || !SOUNDS.music.battle) {
+            console.warn('[SoundManager] 未配置音乐路径，跳过音乐初始化');
+            return;
+        }
+
+        this.music = new Howl({
+            src: [SOUNDS.music.battle],
+            loop: true,
+            volume: this.musicVolume,
+            html5: false, // Web Audio：低延迟，适合 BGM
+            preload: true,
+            onloaderror: (_sprite, error) => {
+                // 文件不存在（用户尚未放入 battle.mp3）时不要让控制台刷屏
+                console.warn(
+                    `[SoundManager] 加载背景音乐失败: ${SOUNDS.music.battle}（请将 .mp3 文件放入 public/music/ 目录）`,
+                    error,
+                );
+            },
+            onplayerror: (_sprite, error) => {
+                console.warn('[SoundManager] 背景音乐播放错误:', error);
+            },
+        });
+
+        this.musicInitialized = true;
+        console.log('[SoundManager] 背景音乐初始化完成');
     }
 
     /**
@@ -172,6 +219,110 @@ class SoundManager {
         console.log(`[SoundManager] 设置 ${String(category)} 音量为 ${volume}`);
     }
 
+    // ===========================================================
+    //                    背景音乐（BGM）控制
+    // ===========================================================
+    // 设计要点：
+    //  - 音乐音量/开关独立于 SFX，避免被主音量滑块污染
+    //  - pause() / play() 组合实现"暂停游戏时断点继续"
+    //  - stop() 才会真正停止（用于重置 / 结束游戏 / 关闭音乐开关）
+    //  - playMusic() 自带幂等保护：已在播放就不再调用 play()
+    // ===========================================================
+
+    /**
+     * 播放/重新开始背景音乐。
+     * - 若处于 paused 状态，会调用 play() 从断点继续
+     * - 若已停止或刚创建，从头开始播放
+     * - 当音乐开关关闭时不会播放
+     */
+    playMusic() {
+        if (!this.music || !this.musicEnabled) return;
+
+        try {
+            // 当前已经在播放中（含"暂停后恢复"场景）：howl.play() 是幂等的
+            // 直接调用即可，不要 stop()，否则会从头开始
+            if (this.musicPaused) {
+                this.music.play();
+                this.musicPaused = false;
+            } else if (!this.music.playing()) {
+                this.music.play();
+                this.musicPaused = false;
+            }
+        } catch (err) {
+            // 浏览器自动播放策略可能拒绝（用户首次进入页面还没点击过任何按钮时）
+            console.warn('[SoundManager] 播放背景音乐被浏览器拒绝（需要用户交互后才能播放）:', err);
+        }
+    }
+
+    /**
+     * 暂停背景音乐（断点处暂停，resumeMusic() 可继续）
+     */
+    pauseMusic() {
+        if (!this.music) return;
+        if (this.music.playing()) {
+            this.music.pause();
+            this.musicPaused = true;
+        }
+    }
+
+    /**
+     * 从断点继续播放背景音乐
+     */
+    resumeMusic() {
+        if (!this.music || !this.musicEnabled) return;
+        if (this.musicPaused) {
+            this.music.play();
+            this.musicPaused = false;
+        }
+    }
+
+    /**
+     * 彻底停止背景音乐（用于重置 / 胜负结束 / 用户手动关闭音乐开关）
+     */
+    stopMusic() {
+        if (!this.music) return;
+        if (this.music.playing() || this.musicPaused) {
+            this.music.stop();
+        }
+        this.musicPaused = false;
+    }
+
+    /**
+     * 设置音乐开关
+     */
+    setMusicEnabled(enabled: boolean) {
+        this.musicEnabled = enabled;
+        if (!enabled) {
+            this.stopMusic();
+        }
+        console.log(`[SoundManager] 背景音乐${enabled ? '开启' : '关闭'}`);
+    }
+
+    /**
+     * 设置音乐音量（0-1，独立于 SFX 主音量）
+     */
+    setMusicVolume(volume: number) {
+        const v = Math.max(0, Math.min(1, volume));
+        this.musicVolume = v;
+        if (this.music) {
+            this.music.volume(v);
+        }
+    }
+
+    /**
+     * 音乐是否启用
+     */
+    isMusicEnabled(): boolean {
+        return this.musicEnabled;
+    }
+
+    /**
+     * 获取当前音乐音量
+     */
+    getMusicVolume(): number {
+        return this.musicVolume;
+    }
+
     /**
      * 是否启用
      */
@@ -188,6 +339,16 @@ class SoundManager {
         }
         this.sounds.clear();
         this.initialized = false;
+
+        // 清理背景音乐
+        if (this.music) {
+            this.music.stop();
+            this.music.unload();
+            this.music = null;
+        }
+        this.musicInitialized = false;
+        this.musicPaused = false;
+
         console.log('[SoundManager] 音效系统已销毁');
     }
 }

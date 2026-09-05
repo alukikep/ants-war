@@ -1,0 +1,3 @@
+# 占位文件：让 music 目录被纳入版本控制。
+# 在此目录放入战斗背景音乐文件 `battle.mp3`（或 .ogg / .wav）后即可播放。
+# 默认与 src/config/sounds.ts 中的 SOUNDS.music.battle 对应。

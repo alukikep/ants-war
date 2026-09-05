@@ -65,14 +65,14 @@ const HEAD_PARTS: PartRow[] = [
   { name: '兵蚁头', attack: '+25', hp: '+10', speed: '-5', attackSpeed: '+0%', cost: 70, desc: '重型战斗头部' },
   { name: '火蚁头', attack: '+0', hp: '+0', speed: '+0', attackSpeed: '+10%', cost: 60, desc: '毒牙攻击' },
   { name: '大齿猛蚁头', attack: '+10', hp: '+0', speed: '+0', attackSpeed: '+0%', cost: 70, desc: '弹射逃脱', highlight: true },
-  { name: '白蚁大兵头', attack: '+5', hp: '+0', speed: '+0', attackSpeed: '+0%', cost: 100, desc: '攻速光环', highlight: true },
-  { name: '大头蚁头', attack: '+5', hp: '+0', speed: '+0', attackSpeed: '+0%', cost: 110, desc: '秒杀', highlight: true },
+  { name: '白蚁大兵头', attack: '+15', hp: '+30', speed: '+0', attackSpeed: '+0%', cost: 100, desc: '攻速光环', highlight: true },
+  { name: '大头蚁头', attack: '+5', hp: '+40', speed: '+0', attackSpeed: '+100%', cost: 110, desc: '秒杀', highlight: true },
 ];
 
 const THORAX_PARTS: PartRow[] = [
   { name: '基础胸部', attack: '+0', hp: '+0', speed: '+0', attackSpeed: '+0%', cost: 0, desc: '标准胸部' },
   { name: '行军蚁胸', attack: '+0', hp: '+0', speed: '+30', attackSpeed: '+0%', cost: 50, desc: '高速移动' },
-  { name: '木蚁胸', attack: '+0', hp: '+15', speed: '+10', attackSpeed: '+0%', cost: 60, desc: '均衡+护甲', highlight: true },
+  { name: '木蚁胸', attack: '+0', hp: '+15', speed: '+10', attackSpeed: '+0%', cost: 60, desc: '护甲分等级', highlight: true },
   { name: '子弹蚁胸', attack: '+0', hp: '-30', speed: '+50', attackSpeed: '+10%', cost: 80, desc: '极速突击', highlight: true },
   { name: '切叶蚁胸', attack: '+0', hp: '+40', speed: '+0', attackSpeed: '+0%', cost: 90, desc: '嘲讽+护甲', highlight: true },
 ];
@@ -82,7 +82,7 @@ const ABDOMEN_PARTS: PartRow[] = [
   { name: '蜜罐蚁腹', attack: '+0', hp: '+40', speed: '-15', attackSpeed: '+0%', cost: 70, desc: '死亡回复', highlight: true },
   { name: '织叶蚁腹', attack: '+0', hp: '+60', speed: '+10', attackSpeed: '+10%', cost: 60, desc: '灵活均衡' },
   { name: '陷阱蚁腹', attack: '+15', hp: '+30', speed: '+0', attackSpeed: '+15%', cost: 70, desc: '爆发输出' },
-  { name: '木蚁腹', attack: '+25', hp: '-80%', speed: '+5', attackSpeed: '+0%', cost: 80, desc: '远程喷酸', highlight: true },
+  { name: '木蚁腹', attack: '+5', hp: '-80%', speed: '+5', attackSpeed: '+0%', cost: 80, desc: '远程喷酸', highlight: true },
   { name: '马塔贝勒蚁腹', attack: '+0', hp: '+80', speed: '+0', attackSpeed: '+0%', cost: 110, desc: '尾针技能', highlight: true },
 ];
 
@@ -337,11 +337,11 @@ export const TutorialModal: React.FC<TutorialModalProps> = ({ open, onClose }) =
             <div className="mt-3 p-3 rounded border border-yellow-500/40 bg-yellow-500/10 text-xs space-y-1">
               <div className="text-yellow-300 font-game font-bold mb-1">🌟 特殊技能一览</div>
               <div className="text-gray-300">• <b>暴击</b>（切叶蚁头）：攻击按孵化室等级 5%/10%/15% 触发，3 倍伤害</div>
-              <div className="text-gray-300">• <b>固定护甲</b>（木蚁胸）：+10 固定护甲（实际伤害 = max(1, 基础伤害 − 10)）</div>
+              <div className="text-gray-300">• <b>固定护甲</b>（木蚁胸）：按孵化室等级 +5/+8/+12 固定护甲（实际伤害 = max(1, 基础伤害 − 护甲)）</div>
               <div className="text-gray-300">• <b>肾上腺素</b>（子弹蚁胸）：首次受敌触发，+50/75/100% 攻击 + 50/60/80% 护甲，持续 5/8/12 秒，60 秒冷却</div>
               <div className="text-gray-300">• <b>弹射逃脱</b>（大齿猛蚁头）：生命 &lt; 40% 时触发，弹射 150px 恢复 50% 生命（10 秒冷却）</div>
               <div className="text-gray-300">• <b>攻速光环</b>（白蚁大兵头）：攻击时为 100px 内队友增加攻速（1/2/3 级 +5/10/15%，上限 300%，每秒衰减 20%）</div>
-              <div className="text-gray-300">• <b>秒杀</b>（大头蚁头）：根据孵化室等级 3%/5%/8% 几率秒杀</div>
+              <div className="text-gray-300">• <b>秒杀</b>（大头蚁头）：+5 攻击/+40 生命/+100% 攻速；根据孵化室等级 3%/5%/8% 几率秒杀</div>
               <div className="text-gray-300">• <b>嘲讽+护甲</b>（切叶蚁胸）：生命 &lt; 20% 触发，100px 范围嘲讽敌人，回复 30% 生命并获得 80% 护甲 5 秒（15 秒冷却）</div>
               <div className="text-gray-300">• <b>死亡回复</b>（蜜罐蚁腹）：死亡时在 80px 范围内为友军各回复 50 HP</div>
               <div className="text-gray-300">• <b>远程喷酸</b>（木蚁腹）：唯一远程攻击部件，发射酸液子弹，享受完整头部攻击力加成（-80% 生命值）</div>

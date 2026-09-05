@@ -89,12 +89,12 @@ export const HEAD_CONFIGS: Record<HeadVariant, PartConfig> = {
     type: 'head',
     variant: 'termiteSoldier',
     stats: {
-      damage: 5,
-      hp: 0,
+      damage: 15,         // 原+5，提升至+15
+      hp: 30,             // 原+0，新增+30生命
       speed: 0,
       attackSpeed: 0,
     },
-    description: '白蚁大兵的巨颚，每次攻击为周围队友提供攻速加成（上限300%，每秒衰减20%）',
+    description: '白蚁大兵的巨颚，+15攻击+30生命，每次攻击为周围队友提供攻速加成（上限300%，每秒衰减20%）',
     cost: 100,
   },
   bigHead: {
@@ -104,12 +104,12 @@ export const HEAD_CONFIGS: Record<HeadVariant, PartConfig> = {
     type: 'head',
     variant: 'bigHead',
     stats: {
-      damage: 5,
-      hp: 0,
+      damage: 5,          // 攻击+5（已回退到原值）
+      hp: 40,             // +40生命（从+30提升至+40）
       speed: 0,
-      attackSpeed: 0,
+      attackSpeed: 100,   // +100%攻速（攻击间隔减半）
     },
-    description: '超大颚部，每次攻击有5%几率秒杀敌人（举起甩飞！）',
+    description: '超大颚部，+5攻击+40生命+100%攻速，每次攻击按孵化室等级3%/5%/8%几率秒杀敌人（举起甩飞！）',
     cost: 110,
   },
 };
@@ -157,9 +157,9 @@ export const THORAX_CONFIGS: Record<ThoraxVariant, PartConfig> = {
       hp: 15,
       speed: 10,
       attackSpeed: 0,
-      flatArmor: 10,
+      flatArmor: 5,             // 基础1级护甲5；按孵化室等级在 gameStore 中升级为 8/12
     },
-    description: '强健的胸部，+10固定护甲（减免伤害，受到11伤害只受1伤害）',
+    description: '强健的胸部，固定护甲按孵化室等级：1级+5 / 2级+8 / 3级+12（受到X伤害实际只受max(1, X-护甲)伤害）',
     cost: 60,
   },
   bullet: {
@@ -263,12 +263,12 @@ export const ABDOMEN_CONFIGS: Record<AbdomenVariant, PartConfig> = {
     type: 'abdomen',
     variant: 'spitter',
     stats: {
-      damage: 25,         // 基础远程伤害25
+      damage: 5,          // 基础远程伤害5（原25，削弱为+5）
       hp: -80,           // -80% 最大生命值
       speed: 5,
       attackSpeed: 0,     // 无攻击速度加成
     },
-    description: '喷酸腺体，远程攻击+25，享受完整头部攻击力加成（-80%生命值）',
+    description: '喷酸腺体，远程攻击+5，享受完整头部攻击力加成（-80%生命值）',
     cost: 80,
   },
   matabele: {
